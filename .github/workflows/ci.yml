@@ -1,0 +1,208 @@
+name: CI
+
+# This project is Windows-only by construction, so CI cannot run on Linux:
+#
+#   * build.cmd compiles with the .NET Framework's csc.exe
+#     (%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\csc.exe). That ships
+#     with Windows and is the whole reason the project needs no .NET SDK and
+#     no NuGet restore — neither of which exists on a Linux runner.
+#   * The installer is a WinForms GUI (/target:winexe, System.Windows.Forms).
+#   * tests/ShimTests.cs executes real MSYS2 bash. Its assertions are about
+#     MSYS2 process behaviour (exit-code propagation, quoting, PATH) and have
+#     no meaning off Windows.
+#
+# A GitHub-hosted windows-latest runner is also *unconfined*, which matters:
+# msys-2.0.dll cannot start under the Windows ACL sandbox (it needs a per-user
+# named section that a write-restricted token denies, giving Win32 error 5).
+# That is why a local sandboxed run reports the 10 ShimTests as skipped. Here
+# they run for real, so CI covers checks a local run cannot.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+# Superseded pushes to the same ref cancel their predecessors.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and test (Windows)
+    runs-on: windows-latest
+
+    # The runner image moves; if a future image ever dropped the .NET
+    # Framework or broke MSYS2, this pins the last known-good combination.
+    # timeout-minutes bounds a hung MSYS2 child rather than letting it burn
+    # the 6-hour default.
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        # The scripts are batch/PowerShell, and the repo is pure ASCII by
+        # policy (build.cmd documents why); bash would only add a translation
+        # layer. Explicit shell also keeps `working-directory` predictable.
+        shell: pwsh
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        # Printed up front so a later "no csc.exe" or "no MSYS2" failure can be
+        # attributed to the image instead of to this commit.
+        run: |
+          Write-Host "OS:        $([System.Environment]::OSVersion.VersionString)"
+          Write-Host "pwsh:      $($PSVersionTable.PSVersion)"
+          Write-Host "node:      $(node --version)"
+
+          $csc = "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          if (-not (Test-Path $csc)) {
+            Write-Error "csc.exe is missing from the runner image: $csc"
+            exit 1
+          }
+          Write-Host "csc:       $csc"
+
+      - name: Install MSYS2
+        # Required by tests/ShimTests.cs, which runs real MSYS2 bash through
+        # the compiled shim. Without an MSYS2 install those tests skip, and the
+        # skip gate below turns that into a failure — deliberately, so CI can
+        # never look green while the central claim of the project is unproven.
+        uses: msys2/setup-msys2@v2
+
+      - name: Build
+        # Builds both targets: build\msys2-installer.exe and build\msys2-tests.exe.
+        # build.cmd exits non-zero on a compile error, which fails the step.
+        run: .\build.cmd all
+
+      - name: Verify build outputs exist
+        # build.cmd reports success by exit code; this asserts the artifacts a
+        # consumer actually needs are on disk, including the shim source that
+        # must ship beside the exe (it is compiled on the target machine).
+        run: |
+          $expected = @(
+            'build\msys2-installer.exe',
+            'build\msys2-tests.exe',
+            'build\Msys2ShellShim.cs'
+          )
+          foreach ($f in $expected) {
+            if (-not (Test-Path $f)) { Write-Error "missing build output: $f"; exit 1 }
+            $len = (Get-Item $f).Length
+            if ($len -eq 0) { Write-Error "empty build output: $f"; exit 1 }
+            Write-Host ("ok   {0} ({1} bytes)" -f $f, $len)
+          }
+
+      - name: Run test suite
+        # msys2-tests.exe exits 1 on any failure and 0 when everything passed
+        # (skips allowed), so its exit code is the gate. Output is captured for
+        # the skip check in the next step and echoed in full either way.
+        run: |
+          $output = & .\build\msys2-tests.exe 2>&1 | Tee-Object -Variable lines
+          $code = $LASTEXITCODE
+          $output | Write-Host
+          # Stash the summary for the gate step below.
+          $output | Out-File -FilePath test-output.txt -Encoding utf8
+          exit $code
+
+      - name: Fail on skipped tests
+        # A skip means a check did not run. On an unconfined windows-latest
+        # runner with MSYS2 installed, the 10 ShimTests must actually execute;
+        # if they report as skipped the environment is wrong, and a green run
+        # would misrepresent coverage. The suite's own summary line is parsed
+        # rather than its exit code, because exit code 0 permits skips.
+        run: |
+          $summary = Select-String -Path test-output.txt -Pattern '^skipped:\s+(\d+)' |
+            Select-Object -First 1
+          if (-not $summary) {
+            Write-Error "could not find the 'skipped:' summary line in the test output"
+            exit 1
+          }
+          $skipped = [int]$summary.Matches[0].Groups[1].Value
+          if ($skipped -gt 0) {
+            Write-Error "$skipped test(s) skipped. On this runner every test must run."
+            exit 1
+          }
+          Write-Host "no tests were skipped"
+
+      - name: Verify headless CLI
+        # The README documents this surface, and a WinForms build can compile
+        # yet still fail before Main's argument parsing. --list is side-effect
+        # free, so it is safe to run here (--install is not: it writes presets).
+        run: |
+          $listing = & .\build\msys2-installer.exe --list
+          if ($LASTEXITCODE -ne 0) { Write-Error "--list exited $LASTEXITCODE"; exit 1 }
+          $listing | Write-Host
+          foreach ($flavour in 'mingw64','mingw32','ucrt64','clang64','clangarm64') {
+            if ($listing -notmatch [regex]::Escape($flavour)) {
+              Write-Error "flavour '$flavour' is missing from --list"
+              exit 1
+            }
+          }
+          Write-Host "all five flavours are listed"
+
+      - name: End-to-end install and preset validation
+        # Exercises the full install path headlessly into the runner's own
+        # DSH_HOME, then validates the written presets with the same YAML
+        # library DSH uses. Scoped to this step's environment so nothing
+        # leaks into later steps.
+        env:
+          DSH_HOME: ${{ github.workspace }}\.ci-dsh-home
+        run: |
+          & .\build\msys2-installer.exe --install
+          if ($LASTEXITCODE -ne 0) { Write-Error "--install exited $LASTEXITCODE"; exit 1 }
+
+          $presets = Join-Path $env:DSH_HOME '.agent-presets'
+          $dirs = Get-ChildItem $presets -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'msys2-*' }
+          if ($dirs.Count -eq 0) {
+            Write-Error "no msys2-* presets were written under $presets"
+            exit 1
+          }
+          Write-Host "wrote $($dirs.Count) preset(s):"
+          $dirs | ForEach-Object { Write-Host "  $($_.Name)" }
+
+          # The shim is compiled at install time; it must be a real executable.
+          foreach ($d in $dirs) {
+            $shim = Join-Path $d.FullName 'msys2_shell_shim.exe'
+            if (-not (Test-Path $shim)) { Write-Error "no shim in $($d.Name)"; exit 1 }
+            if ((Get-Item $shim).Length -eq 0) { Write-Error "empty shim in $($d.Name)"; exit 1 }
+          }
+
+          # validate-preset.cjs deliberately validates with the same YAML
+          # library DSH uses, which it loads from the installed harness at
+          # $USERPROFILE\.dsh\profiles\node_modules\js-yaml. That path does not
+          # exist on a clean runner, and overriding USERPROFILE to fake it
+          # would break the lookup it is meant to satisfy. Install js-yaml into
+          # the exact directory the script reads instead. (It exits 2 rather
+          # than skipping when the library is absent, so this must be real.)
+          $yamlDir = Join-Path $env:USERPROFILE '.dsh\profiles'
+          if (-not (Test-Path (Join-Path $yamlDir 'node_modules\js-yaml'))) {
+            New-Item -ItemType Directory -Force -Path $yamlDir | Out-Null
+            Push-Location $yamlDir
+            try {
+              npm install --no-save --no-package-lock --silent js-yaml@4
+              if ($LASTEXITCODE -ne 0) { Write-Error "npm install js-yaml failed"; exit 1 }
+            } finally { Pop-Location }
+          }
+          node tests/validate-preset.cjs $presets
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "preset validation failed with exit code $LASTEXITCODE"
+            exit 1
+          }
+
+      - name: Upload build artifacts
+        # Always, so a failed run still yields the exes for inspection.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: msys2-installer
+          path: |
+            build/msys2-installer.exe
+            build/msys2-tests.exe
+            build/Msys2ShellShim.cs
+          if-no-files-found: warn
