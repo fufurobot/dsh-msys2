@@ -43,12 +43,22 @@ namespace Dsh.Msys2Installer.Tests
         {
             skipReason = null;
 
+            // Guess() is configuration-first (DSH_MSYS2_ROOT, then .env), so on
+            // CI this resolves to <workspace>\msys\msys64 and on a developer's
+            // machine to whatever their .env names — never to a path baked into
+            // the test.
             string shellCmd = Msys2Discovery.Guess();
             if (shellCmd == null)
             {
-                skipReason = "no MSYS2 install found on this machine";
+                skipReason = "no MSYS2 install found on this machine:\n"
+                    + Msys2Discovery.DescribeFailure();
                 return null;
             }
+
+            // The shim and msys2_shell.cmd are separate processes that each
+            // rediscover MSYS2. Publishing the choice here is what makes them
+            // agree with this test rather than each guessing independently.
+            DshConfig.PublishMsys2Root(shellCmd);
 
             var fixture = new Fixture();
             fixture.ShellCmd = shellCmd;

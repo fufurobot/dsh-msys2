@@ -16,8 +16,8 @@ build\msys2-installer.exe # open the GUI
 ```
 
 Then tick the flavours you want and press Install. The GUI finds
-`msys2_shell.cmd` automatically (PATH first, then the usual locations); if it
-cannot, Browse… opens a file dialog and the selected path is validated
+`msys2_shell.cmd` automatically (see [Finding MSYS2](#finding-msys2) below); if
+it cannot, Browse… opens a file dialog and the selected path is validated
 immediately, with the reason shown when it is wrong.
 
 Headless, for scripting:
@@ -27,6 +27,54 @@ build\msys2-installer.exe --list
 build\msys2-installer.exe --install
 build\msys2-installer.exe --install --shell-cmd C:\msys64\msys2_shell.cmd --flavour mingw64
 ```
+
+## Finding MSYS2
+
+Discovery is tried in this order, and the first source that yields a real
+`msys2_shell.cmd` — one with `usr\bin\bash.exe` beside it — wins:
+
+| # | Source | Use it when |
+| --- | --- | --- |
+| 1 | `DSH_MSYS2_ROOT` environment variable | you want to override for one shell or one command |
+| 2 | `.env` (git-ignored) | you keep MSYS2 somewhere unusual, or keep several and want to pin one |
+| 3 | `%GITHUB_WORKSPACE%\msys\msys64` | CI, where the MSYS2 install is checked out beside the sources |
+| 4 | `msys2_shell.cmd` on `PATH` | MSYS2 is already on your PATH |
+| 5 | the usual locations | `%USERPROFILE%\Downloads\msys64`, `%USERPROFILE%\msys64`, `C:\msys64`, `C:\tools\msys64` |
+
+Most machines need no configuration at all: PATH or the usual locations will
+already find MSYS2. To pin a specific install, copy the example file and edit
+it — `.env` is ignored by git on purpose, because which MSYS2 tree you use is a
+property of your machine rather than of the repository:
+
+```
+copy .env.example .env
+```
+
+```
+# .env
+DSH_MSYS2_ROOT=C:\msys64
+```
+
+The value may also be the `msys2_shell.cmd` file itself, may end in a
+separator, and may be quoted. `MSYS2_ROOT` and `DSH_MSYS2_HOME` are accepted as
+aliases. Values are never interpolated, so a `$` or `%` in a path is literal.
+The GUI writes this file for you when you pick a path with Browse…, so a manual
+pick only has to be made once.
+
+The installer, the test suite and the shim all share this one implementation,
+so they can never disagree about where MSYS2 is. When discovery does fail, the
+error names every source it tried.
+
+### On CI
+
+`.github/workflows/ci.yml` installs MSYS2 with an explicit
+`location: ${{ github.workspace }}\msys`, so it lands at
+`%GITHUB_WORKSPACE%\msys\msys64` — source 3 above, needing no configuration.
+That is deliberate: `${{ github.workspace }}` *is* the `GITHUB_WORKSPACE`
+variable, so discovery derives the path in code rather than hard-coding a
+runner path, and both CI and release workflows verify the layout before the
+suite runs. A runner set up any other way still works, because sources 1, 2, 4
+and 5 are all searched too.
 
 ## What gets installed
 
@@ -123,12 +171,13 @@ report can be attributed correctly.
 
 | Path | Contents |
 | --- | --- |
-| `src/Msys2Flavour.cs` | the five flavours; `msys2_shell.cmd` discovery and validation; paths |
+| `src/Msys2Flavour.cs` | the five flavours; `msys2_shell.cmd` discovery and validation; `.env` reading; paths |
 | `src/PresetWriter.cs` | composition/metadata/README generation; install and uninstall |
 | `src/ShimBuilder.cs` | locating `csc.exe` and compiling the shim |
 | `src/Msys2ShellShim.cs` | the shim itself |
 | `src/InstallerForm.cs` | the WinForms GUI and the headless CLI |
 | `tests/` | the C# test suite |
+| `.env.example` | template for the git-ignored per-machine MSYS2 configuration |
 
 ## Tests
 

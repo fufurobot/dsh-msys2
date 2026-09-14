@@ -1,0 +1,361 @@
+name: Release
+
+# Release gate for this project.
+#
+# Policy: called on a PUBLISHED RELEASE, and it does what ci.yml does not —
+# it REFUSES TO PASS unless every test actually executed. In ci.yml a skipped
+# test is reported and tolerated (the default branch may skip). Here a skipped
+# test is a failure, because a release claim that rests on an unrun check is
+# the exact thing this workflow exists to prevent.
+#
+# Why the strictness is not paranoia for THIS project: the 10 ShimTests are the
+# only tests that prove the installer's central claim — that a command reaches
+# the intended MSYS2 environment, that exit codes propagate, and that quoting
+# survives. They skip whenever MSYS2 cannot start (no MSYS2 installed, or a
+# confined process). A release that shipped while those 10 skipped would be
+# shipping the README's promise with none of its evidence.
+
+on:
+  release:
+    types: [published]
+  # Manual re-run against an existing tag, for when a release needs re-gating
+  # without republishing it.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to verify (defaults to the checked-out ref)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
+
+env:
+  COVERAGE_TOOLS: ${{ github.workspace }}\.coverage-tools
+
+jobs:
+  verify-release:
+    name: Verify release (all tests must run)
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out the released tag
+        uses: actions/checkout@v4
+        with:
+          # Verify the exact released commit, not whatever the default branch
+          # has advanced to since. On workflow_dispatch, an explicit tag wins.
+          ref: ${{ inputs.tag || github.event.release.tag_name || github.ref }}
+
+      - name: Record what is being verified
+        run: |
+          Write-Host "ref:  ${{ inputs.tag || github.event.release.tag_name || github.ref }}"
+          Write-Host "sha:  ${{ github.sha }}"
+          if ('${{ github.event.release.tag_name }}') {
+            Write-Host "release: ${{ github.event.release.name }}"
+          }
+
+      - name: Show toolchain
+        run: |
+          Write-Host "OS:        $([System.Environment]::OSVersion.VersionString)"
+          Write-Host "pwsh:      $($PSVersionTable.PSVersion)"
+          Write-Host "node:      $(node --version)"
+
+          $csc = "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          if (-not (Test-Path $csc)) {
+            Write-Error "csc.exe is missing from the runner image: $csc"
+            exit 1
+          }
+          Write-Host "csc:       $csc"
+
+      - name: Install MSYS2
+        # Non-negotiable here. Without MSYS2 the 10 ShimTests cannot run, and
+        # this workflow fails on any test that does not run.
+        #
+        # `location` is set explicitly so the tree lands at a path this
+        # repository can state outright: ${{ github.workspace }}\msys\msys64.
+        # ${{ github.workspace }} IS the GITHUB_WORKSPACE variable, which is
+        # what lets Msys2Discovery derive the same path in code rather than
+        # hard-coding a runner path. The action's default ($RUNNER_TOOL_CACHE
+        # \msys2) is also searched, so this makes the layout explicit rather
+        # than merely possible.
+        uses: msys2/setup-msys2@v2
+        with:
+          location: ${{ github.workspace }}\msys
+
+      - name: Verify MSYS2 landed where discovery expects it
+        # Checked before anything runs. Were MSYS2 missing, the suite would
+        # report the ShimTests as skipped, and this workflow's whole purpose is
+        # to refuse that — but "10 tests were skipped" is a much worse error
+        # message than "the install is not where discovery looks".
+        run: |
+          $root = Join-Path $env:GITHUB_WORKSPACE 'msys\msys64'
+          foreach ($f in @((Join-Path $root 'msys2_shell.cmd'), (Join-Path $root 'usr\bin\bash.exe'))) {
+            if (-not (Test-Path $f)) {
+              Write-Error "MSYS2 is not where discovery looks: $f is missing"
+              exit 1
+            }
+            Write-Host "ok   $f"
+          }
+
+      - name: Build
+        run: .\build.cmd all
+
+      - name: Verify build outputs exist
+        run: |
+          $expected = @(
+            'build\msys2-installer.exe',
+            'build\msys2-tests.exe',
+            'build\Msys2ShellShim.cs'
+          )
+          foreach ($f in $expected) {
+            if (-not (Test-Path $f)) { Write-Error "missing build output: $f"; exit 1 }
+            $len = (Get-Item $f).Length
+            if ($len -eq 0) { Write-Error "empty build output: $f"; exit 1 }
+            Write-Host ("ok   {0} ({1} bytes)" -f $f, $len)
+          }
+
+      # ── coverage ───────────────────────────────────────────────────────────
+      # Same approach as ci.yml, and the same reason for the /debug:full
+      # rebuild: OpenCover reports line/branch data from PDB sequence points,
+      # and build.cmd does not emit a PDB. The recompile mirrors build.cmd's
+      # :do_tests target exactly (sources, /main, references).
+
+      - name: Build test assembly with debug symbols
+        run: |
+          $csc = "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+
+          & $csc /nologo /target:exe /platform:anycpu /optimize- /debug:full /warn:4 `
+            /main:Dsh.Msys2Installer.Tests.TestMain `
+            /out:build\msys2-tests.exe `
+            /reference:System.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll `
+            src\Msys2Flavour.cs src\ShimBuilder.cs src\PresetWriter.cs src\InstallerForm.cs `
+            tests\TestFramework.cs tests\InstallerTests.cs tests\ShimTests.cs tests\TestMain.cs
+          if ($LASTEXITCODE -ne 0) { Write-Error "debug build failed"; exit 1 }
+
+          if (-not (Test-Path build\msys2-tests.pdb)) {
+            Write-Error "no PDB was produced; coverage would have no sequence points to report"
+            exit 1
+          }
+          Write-Host "debug symbols: build\msys2-tests.pdb"
+
+      - name: Install coverage tooling
+        # Fatal here, unlike ci.yml: a release verification that cannot measure
+        # coverage has not verified what it claims to.
+        run: |
+          $dest = "$env:COVERAGE_TOOLS\opencover"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $nupkg = "$env:COVERAGE_TOOLS\opencover.zip"
+
+          $url = 'https://www.nuget.org/api/v2/package/OpenCover/4.7.1221'
+          Write-Host "downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile $nupkg -UseBasicParsing
+          Expand-Archive -Path $nupkg -DestinationPath $dest -Force
+
+          $console = Get-ChildItem -Path $dest -Recurse -Filter 'OpenCover.Console.exe' |
+            Select-Object -First 1
+          if (-not $console) { throw "OpenCover.Console.exe not found in the package" }
+          Write-Host "coverage tool: $($console.FullName)"
+          "console=$($console.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        id: coverage_tools
+
+      - name: Run the full test suite
+        # Run the suite DIRECTLY, not only under OpenCover. This is the release
+        # gate, so the authoritative pass/fail signal must come from the test
+        # runner itself rather than from a wrapper whose exit code can also
+        # reflect its own instrumentation failures.
+        run: |
+          & .\build\msys2-tests.exe 2>&1 | Tee-Object -FilePath test-output.txt
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Write-Error "the test suite reported failures (exit $code)"
+            exit $code
+          }
+
+      - name: Require that every test actually ran
+        # The strict counterpart to ci.yml's "report the skips" step.
+        #
+        # The suite's exit code is 0 when tests are merely skipped, so the exit
+        # code alone cannot gate a release. The counts are parsed instead, and
+        # any skip at all is fatal.
+        run: |
+          $counts = @{}
+          foreach ($line in (Select-String -Path test-output.txt -Pattern '^(passed|failed|skipped|total):\s+(\d+)')) {
+            $p = $line.Line -split ':\s+'
+            $counts[$p[0]] = [int]$p[1]
+          }
+
+          foreach ($k in 'passed','failed','skipped','total') {
+            if (-not $counts.ContainsKey($k)) {
+              Write-Error "could not read the '$k' count from the test output"
+              exit 1
+            }
+          }
+
+          Write-Host "passed:  $($counts['passed'])"
+          Write-Host "failed:  $($counts['failed'])"
+          Write-Host "skipped: $($counts['skipped'])"
+          Write-Host "total:   $($counts['total'])"
+
+          if ($counts['failed'] -gt 0) {
+            Write-Error "$($counts['failed']) test(s) failed; a release cannot be verified on a failing suite"
+            exit 1
+          }
+
+          if ($counts['skipped'] -gt 0) {
+            Write-Host ""
+            Write-Host "Skipped tests:"
+            # TestMain.cs writes "  <name> — <reason>" with an em dash (U+2014),
+            # spelled here as an escape so the pattern survives re-encoding.
+            $skipPattern = "^\s{2}(\S+)\s+" + [char]0x2014 + "\s+(.+)$"
+            Select-String -Path test-output.txt -Pattern $skipPattern |
+              ForEach-Object { Write-Host "  $($_.Matches[0].Groups[1].Value) — $($_.Matches[0].Groups[2].Value)" }
+            Write-Error ("$($counts['skipped']) test(s) did not run. A release requires every test to execute; " +
+              "the usual cause is MSYS2 being unavailable or the process being confined.")
+            exit 1
+          }
+
+          if ($counts['total'] -le 0) {
+            Write-Error "the suite ran no tests at all"
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "all $($counts['total']) tests passed with nothing skipped"
+
+      - name: Measure coverage on the released build
+        # Runs after the gate above, so coverage never masks a test result.
+        run: |
+          $console = '${{ steps.coverage_tools.outputs.console }}'
+          & $console -register:user `
+            -target:build\msys2-tests.exe `
+            -targetdir:build `
+            -filter:"+[Dsh*]* -[Dsh*]Tests.*" `
+            -output:coverage.xml 2>&1 | Tee-Object -FilePath coverage-run.txt
+          if (-not (Test-Path coverage.xml)) {
+            Write-Error "coverage.xml was not produced"
+            exit 1
+          }
+          Write-Host "coverage written to coverage.xml"
+
+      - name: Verify the headless CLI
+        run: |
+          $listing = & .\build\msys2-installer.exe --list
+          if ($LASTEXITCODE -ne 0) { Write-Error "--list exited $LASTEXITCODE"; exit 1 }
+          $listing | Write-Host
+          foreach ($flavour in 'mingw64','mingw32','ucrt64','clang64','clangarm64') {
+            if ($listing -notmatch [regex]::Escape($flavour)) {
+              Write-Error "flavour '$flavour' is missing from --list"
+              exit 1
+            }
+          }
+          Write-Host "all five flavours are listed"
+
+      - name: End-to-end install and preset validation
+        # Run against the REAL default DSH_HOME here, because this is the
+        # configuration a user actually gets on a released build.
+        run: |
+          & .\build\msys2-installer.exe --install
+          if ($LASTEXITCODE -ne 0) { Write-Error "--install exited $LASTEXITCODE"; exit 1 }
+
+          $presets = Join-Path $env:USERPROFILE '.dsh\.agent-presets'
+          $dirs = Get-ChildItem $presets -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'msys2-*' }
+          if ($dirs.Count -eq 0) {
+            Write-Error "no msys2-* presets were written under $presets"
+            exit 1
+          }
+
+          # A release must install ALL five flavours, not merely some.
+          $expected = 'msys2-mingw64','msys2-mingw32','msys2-ucrt64','msys2-clang64','msys2-clangarm64'
+          foreach ($name in $expected) {
+            if ($dirs.Name -notcontains $name) {
+              Write-Error "release install did not produce the preset '$name'"
+              exit 1
+            }
+            $shim = Join-Path (Join-Path $presets $name) 'msys2_shell_shim.exe'
+            if (-not (Test-Path $shim)) { Write-Error "no shim in $name"; exit 1 }
+            if ((Get-Item $shim).Length -eq 0) { Write-Error "empty shim in $name"; exit 1 }
+          }
+          Write-Host "installed and compiled the shim for all 5 flavours"
+
+          $yamlDir = Join-Path $env:USERPROFILE '.dsh\profiles'
+          if (-not (Test-Path (Join-Path $yamlDir 'node_modules\js-yaml'))) {
+            New-Item -ItemType Directory -Force -Path $yamlDir | Out-Null
+            Push-Location $yamlDir
+            try {
+              npm install --no-save --no-package-lock --silent js-yaml@4
+              if ($LASTEXITCODE -ne 0) { Write-Error "npm install js-yaml failed"; exit 1 }
+            } finally { Pop-Location }
+          }
+          node tests/validate-preset.cjs $presets
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "preset validation failed with exit code $LASTEXITCODE"
+            exit 1
+          }
+
+      - name: Write the release verification summary
+        if: always()
+        run: |
+          $summary = @()
+          $summary += "## Release verification"
+          $summary += ""
+          $summary += 'Ref: `${{ inputs.tag || github.event.release.tag_name || github.ref }}`'
+          $summary += ""
+          $summary += "**Policy: every test must run.** A skip fails this workflow."
+          $summary += ""
+
+          $counts = Select-String -Path test-output.txt -Pattern '^(passed|failed|skipped|total):\s+(\d+)' -ErrorAction SilentlyContinue
+          if ($counts) {
+            $summary += "| Result | Count |"
+            $summary += "| --- | --- |"
+            foreach ($line in $counts) {
+              $p = $line.Line -split ':\s+'
+              $summary += "| $($p[0]) | $($p[1]) |"
+            }
+            $summary += ""
+          }
+
+          if (Test-Path coverage.xml) {
+            try {
+              [xml]$cov = Get-Content coverage.xml -Raw
+              $o = $cov.CoverageSession.Summary
+              $summary += "### Code coverage on the released build"
+              $summary += ""
+              $summary += "| Metric | Covered | Total | Percent |"
+              $summary += "| --- | --- | --- | --- |"
+              $summary += "| Lines | $($o.visitedSequencePoints) | $($o.numSequencePoints) | $($o.sequenceCoverage)% |"
+              $summary += "| Branches | $($o.visitedBranchPoints) | $($o.numBranchPoints) | $($o.branchCoverage)% |"
+              $summary += "| Methods | $($o.visitedMethods) | $($o.numMethods) | $($o.methodCoverage)% |"
+            } catch {
+              $summary += "Coverage XML could not be parsed: $($_.Exception.Message)"
+            }
+          } else {
+            $summary += "No coverage was produced."
+          }
+
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $summary | ForEach-Object { Write-Host $_ }
+
+      - name: Upload release verification artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-verification
+          path: |
+            coverage.xml
+            test-output.txt
+            build/msys2-installer.exe
+            build/msys2-tests.exe
+            build/msys2-tests.pdb
+            build/Msys2ShellShim.cs
+          if-no-files-found: warn

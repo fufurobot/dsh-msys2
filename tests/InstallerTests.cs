@@ -201,9 +201,10 @@ namespace Dsh.Msys2Installer.Tests
         [TestMethod]
         public void WellKnownLocationsIncludeTheRealDownloadsLayout()
         {
-            // The user's install lives at %USERPROFILE%\Downloads\msys64, so the
-            // guess list must cover exactly that shape or discovery fails on the
-            // machine this was written for.
+            // A manual pick must still be able to find the common
+            // %USERPROFILE%\Downloads\msys64 shape, which is what the file
+            // dialog pre-fills from. The list may lead with runner-specific
+            // roots, so this checks membership rather than position.
             string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             string expected = Path.Combine(home, "Downloads", "msys64", "msys2_shell.cmd");
 
@@ -815,27 +816,531 @@ namespace Dsh.Msys2Installer.Tests
     }
 
     [TestClass]
-    public sealed class PathDiscoveryIntegrationTests
+    public sealed class ConfigTests
     {
-        [TestMethod]
-        public void TheRealInstallOnThisMachineIsDiscovered()
+        /// <summary>
+        /// Run an action with the given environment variables set, restoring
+        /// every one of them afterwards. Process-wide state and tests do not
+        /// mix, so the restore is not optional.
+        /// </summary>
+        internal static void WithEnvironment(Dictionary<string, string> values, Action body)
         {
-            // The user's MSYS2 lives at %USERPROFILE%\Downloads\msys64. If this
-            // fails, auto-discovery on this machine is broken.
-            string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            string expected = Path.Combine(home, "Downloads", "msys64", "msys2_shell.cmd");
+            var saved = new Dictionary<string, string>();
+            foreach (string key in values.Keys)
+                saved[key] = Environment.GetEnvironmentVariable(key);
 
-            if (!File.Exists(expected))
-                throw new AssertionException("expected MSYS2 at " + expected + " but it is not there");
-
-            Assert.IsNull(Msys2Discovery.Validate(expected), "the real install should validate");
+            try
+            {
+                foreach (KeyValuePair<string, string> pair in values)
+                    Environment.SetEnvironmentVariable(pair.Key, pair.Value);
+                body();
+            }
+            finally
+            {
+                foreach (KeyValuePair<string, string> pair in saved)
+                    Environment.SetEnvironmentVariable(pair.Key, pair.Value);
+            }
         }
 
         [TestMethod]
-        public void GuessPrefersPathButFallsBackToTheRealInstall()
+        public void EnvironmentVariableNamesTheInstallRoot()
         {
+            string dir = TestScratch.NewDirectory("envvar");
+            try
+            {
+                string root = DiscoveryTests.MakeFakeMsysRoot("envvar-root");
+                string shellCmd = Path.Combine(root, "msys2_shell.cmd");
+
+                WithEnvironment(new Dictionary<string, string> { { "DSH_MSYS2_ROOT", root } },
+                    delegate
+                    {
+                        Assert.AreEqual(shellCmd, Msys2Discovery.ExplicitRoot(),
+                            "DSH_MSYS2_ROOT must name the install directory");
+                        Assert.AreEqual(shellCmd, Msys2Discovery.Guess(),
+                            "the configured root must win over PATH and the usual locations");
+                    });
+                Directory.Delete(root, true);
+            }
+            finally { TestScratch.Cleanup(dir); }
+        }
+
+        [TestMethod]
+        public void EnvironmentVariableMayNameTheShellCmdItself()
+        {
+            // Handing over the launcher path rather than its directory is the
+            // obvious mistake to make, so it must work rather than fail.
+            string root = DiscoveryTests.MakeFakeMsysRoot("envvar-cmd");
+            try
+            {
+                string shellCmd = Path.Combine(root, "msys2_shell.cmd");
+                WithEnvironment(new Dictionary<string, string> { { "DSH_MSYS2_ROOT", shellCmd } },
+                    delegate
+                    {
+                        Assert.AreEqual(shellCmd, Msys2Discovery.ExplicitRoot(),
+                            "naming msys2_shell.cmd directly must resolve to itself");
+                    });
+            }
+            finally { Directory.Delete(root, true); }
+        }
+
+        [TestMethod]
+        public void EnvironmentVariableToleratesQuotesAndTrailingSlash()
+        {
+            string root = DiscoveryTests.MakeFakeMsysRoot("envvar-quoted");
+            try
+            {
+                string shellCmd = Path.Combine(root, "msys2_shell.cmd");
+                WithEnvironment(new Dictionary<string, string> { { "DSH_MSYS2_ROOT", "\"" + root + "\\\"" } },
+                    delegate
+                    {
+                        Assert.AreEqual(shellCmd, Msys2Discovery.ExplicitRoot(),
+                            "quotes and a trailing separator must not defeat the lookup");
+                    });
+            }
+            finally { Directory.Delete(root, true); }
+        }
+
+        [TestMethod]
+        public void EnvFileSuppliesTheInstallRoot()
+        {
+            // A .env at the checkout root is the documented place to configure
+            // this. The file is planted at the real workspace root — where the
+            // suite actually looks — and removed again afterwards.
+            string checkout = Msys2Discovery.CheckoutDirectory();
+            if (checkout == null)
+                throw new SkipException("no checkout could be derived, so .env cannot be placed");
+
+            string file = Path.Combine(checkout, ".env");
+            string savedEnv = File.Exists(file) ? File.ReadAllText(file) : null;
+            string root = DiscoveryTests.MakeFakeMsysRoot("envfile-root");
+            try
+            {
+                string shellCmd = Path.Combine(root, "msys2_shell.cmd");
+                File.WriteAllText(file, "DSH_MSYS2_ROOT=" + root + "\n");
+
+                Assert.AreEqual(root, Msys2Discovery.ConfiguredRoot(),
+                    "the checkout root's .env must name the install directory");
+
+                Assert.AreEqual(shellCmd, Msys2Discovery.FindUnder(Msys2Discovery.ConfiguredRoot()),
+                    "the configured directory must resolve to " + shellCmd);
+            }
+            finally
+            {
+                // Never leave a configuration behind: this file decides where
+                // the installer looks on this machine.
+                if (savedEnv != null) File.WriteAllText(file, savedEnv);
+                else if (File.Exists(file)) File.Delete(file);
+
+                Directory.Delete(root, true);
+            }
+        }
+
+        [TestMethod]
+        public void EnvFileParsingHandlesTheDocumentedForms()
+        {
+            string dir = TestScratch.NewDirectory("envparse");
+            try
+            {
+                string file = Path.Combine(dir, ".env");
+                File.WriteAllText(file,
+                    "# a comment\r\n"
+                    + "\r\n"
+                    + "  \r\n"
+                    + "MSYS2_ROOT: C:\\from-colon\r\n"
+                    + "export DSH_MSYS2_ROOT='C:\\quoted path\\msys64'\r\n"
+                    + "UNRELATED=ignored\r\n"
+                    + "DOUBLE=\"C:\\\\doubled\"\r\n"
+                    + "no_separator_here\r\n");
+
+                Dictionary<string, string> values = Msys2Discovery.ParseEnvFile(file);
+
+                Assert.AreEqual("C:\\from-colon", values["MSYS2_ROOT"], "KEY: value form");
+                Assert.AreEqual("C:\\quoted path\\msys64", values["DSH_MSYS2_ROOT"],
+                    "single quotes are literal and `export` is accepted");
+                Assert.AreEqual("ignored", values["UNRELATED"], "unrelated keys are read but unused");
+                Assert.AreEqual("C:\\doubled", values["DOUBLE"], "an escaped backslash is undoubled");
+                Assert.IsFalse(values.ContainsKey("no_separator_here"), "a line with no separator is skipped");
+                Assert.IsFalse(values.ContainsKey("# a comment"), "comments are not keys");
+            }
+            finally { TestScratch.Cleanup(dir); }
+        }
+
+        [TestMethod]
+        public void EnvFileParsingNeverThrowsOnAMissingFile()
+        {
+            Dictionary<string, string> values = Msys2Discovery.ParseEnvFile(
+                Path.Combine(TestScratch.Root(), "no-such-file-" + Guid.NewGuid().ToString("N")));
+
+            Assert.IsNotNull(values, "a missing .env must yield an empty result, not null");
+            Assert.AreEqual(0, values.Count, "a missing .env must yield an empty result");
+        }
+
+        [TestMethod]
+        public void RootKeysAreConsultedInOrder()
+        {
+            // DSH_MSYS2_ROOT is the documented key, but MSYS2_ROOT and
+            // DSH_MSYS2_HOME are accepted too. An empty preferred key must fall
+            // through rather than disable the file.
+            string dir = TestScratch.NewDirectory("envkeys");
+            try
+            {
+                string file = Path.Combine(dir, ".env");
+                Dictionary<string, string> values;
+
+                File.WriteAllText(file, "MSYS2_ROOT=C:\\secondary\n");
+                values = Msys2Discovery.ParseEnvFile(file);
+                Assert.AreEqual("C:\\secondary", values["MSYS2_ROOT"], "MSYS2_ROOT must be readable");
+
+                File.WriteAllText(file, "DSH_MSYS2_ROOT=\nMSYS2_ROOT=C:\\fallback\n");
+                values = Msys2Discovery.ParseEnvFile(file);
+                Assert.AreEqual("", values["DSH_MSYS2_ROOT"], "an empty value parses as empty");
+                Assert.AreEqual("C:\\fallback", values["MSYS2_ROOT"], "the next key must still be readable");
+            }
+            finally { TestScratch.Cleanup(dir); }
+        }
+
+        [TestMethod]
+        public void EnvFileBelowTheCheckoutRootIsIgnored()
+        {
+            // A .env that ships with the sources must never decide where MSYS2
+            // is, or every clone of the repository would point at one
+            // developer's install. Only the checkout ROOT's .env counts.
+            //
+            // The tree here is planted inside the real workspace, so the rule
+            // is exercised against the checkout the suite is actually running
+            // from rather than a synthetic one.
+            string checkout = Msys2Discovery.CheckoutDirectory();
+            if (checkout == null)
+                throw new SkipException("no checkout could be derived, so the rule cannot be exercised");
+
+            string inner = Path.Combine(TestScratch.Root(), "checkout-rule-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(inner);
+            try
+            {
+                File.WriteAllText(Path.Combine(inner, ".env"), "DSH_MSYS2_ROOT=C:\\stray\\msys64\n");
+
+                string saved = Directory.GetCurrentDirectory();
+                try
+                {
+                    Directory.SetCurrentDirectory(inner);
+
+                    // The nested .env must not be among the files read...
+                    var sawInner = false;
+                    foreach (string candidate in Msys2Discovery.ConfigFileCandidates())
+                        if (string.Equals(candidate, Path.Combine(inner, ".env"),
+                            StringComparison.OrdinalIgnoreCase)) sawInner = true;
+                    Assert.IsFalse(sawInner,
+                        "a .env below the checkout root must not be read: " + Path.Combine(inner, ".env"));
+
+                    // ...but the checkout root's own .env must still be
+                    // considered, so a root-level configuration keeps working
+                    // from any subdirectory.
+                    var sawRoot = false;
+                    foreach (string candidate in Msys2Discovery.ConfigFileCandidates())
+                        if (string.Equals(candidate, Path.Combine(checkout, ".env"),
+                            StringComparison.OrdinalIgnoreCase)) sawRoot = true;
+                    Assert.IsTrue(sawRoot,
+                        "the checkout root's .env must be read from a subdirectory: "
+                        + Path.Combine(checkout, ".env"));
+                }
+                finally { Directory.SetCurrentDirectory(saved); }
+            }
+            finally { TestScratch.Cleanup(inner); }
+        }
+
+        [TestMethod]
+        public void GitHubWorkspaceLayoutIsSearchedAtTheWorkspace()
+        {
+            // The CI layout: ci.yml sets setup-msys2's `location:` input to
+            // ${{ github.workspace }}\msys, so MSYS2 lands in
+            // <workspace>\msys\msys64. ${{ github.workspace }} IS the
+            // GITHUB_WORKSPACE variable, which is what makes this derivable.
+            string workspace = TestScratch.NewDirectory("ghworkspace");
+            try
+            {
+                string msys = Path.Combine(workspace, "msys", "msys64");
+                Directory.CreateDirectory(Path.Combine(msys, "usr", "bin"));
+                File.WriteAllText(Path.Combine(msys, "msys2_shell.cmd"), "@echo off\r\n");
+                File.WriteAllText(Path.Combine(msys, "usr", "bin", "bash.exe"), "x");
+                string expected = Path.Combine(msys, "msys2_shell.cmd");
+
+                WithEnvironment(new Dictionary<string, string> { { "GITHUB_WORKSPACE", workspace } },
+                    delegate
+                    {
+                        var found = false;
+                        foreach (string candidate in Msys2Discovery.GitHubWorkspaceRoots())
+                            if (string.Equals(candidate, msys, StringComparison.OrdinalIgnoreCase)) found = true;
+
+                        Assert.IsTrue(found,
+                            "the workspace\\msys\\msys64 root must be searched: "
+                            + string.Join(", ", Msys2Discovery.GitHubWorkspaceRoots().ToArray()));
+
+                        var foundShell = false;
+                        foreach (string candidate in Msys2Discovery.WellKnownLocations())
+                            if (string.Equals(candidate, expected, StringComparison.OrdinalIgnoreCase)) foundShell = true;
+
+                        Assert.IsTrue(foundShell,
+                            "discovery must offer " + expected + ", which is where CI installs MSYS2");
+                    });
+            }
+            finally { TestScratch.Cleanup(workspace); }
+        }
+
+        [TestMethod]
+        public void GitHubWorkspaceLayoutIsNotInventedWithoutAWorkspace()
+        {
+            // Not being on CI must not make the runner layout look available,
+            // or a local run would search a path that cannot exist.
+            WithEnvironment(new Dictionary<string, string> { { "GITHUB_WORKSPACE", null } },
+                delegate
+                {
+                    Assert.AreEqual(0, Msys2Discovery.GitHubWorkspaceRoots().Count,
+                        "the runner layout must be absent when GITHUB_WORKSPACE is unset");
+                });
+        }
+
+        [TestMethod]
+        public void CheckoutDirectoryPrefersTheWorkspaceVariable()
+        {
+            string workspace = TestScratch.NewDirectory("checkoutvar");
+            try
+            {
+                WithEnvironment(new Dictionary<string, string> { { "GITHUB_WORKSPACE", workspace } },
+                    delegate
+                    {
+                        Assert.AreEqual(Path.GetFullPath(workspace), Msys2Discovery.CheckoutDirectory(),
+                            "GITHUB_WORKSPACE is the checkout when it is set");
+                    });
+            }
+            finally { TestScratch.Cleanup(workspace); }
+        }
+
+        [TestMethod]
+        public void CheckoutDirectoryRecoversTheLocalGitHubActionsRoot()
+        {
+            // Outside a runner, LOCALAPPDATA\GitHubActions\...\work\<repo>\<repo>
+            // is this machine's checkout. This is what lets the CI branch of
+            // CheckoutDirectory be exercised without being on CI, and what
+            // makes `dsh shell` runs and workflow runs agree on one .env.
+            string local = TestScratch.NewDirectory("localappdata");
+            string repo = Path.Combine(local, "GitHubActions", "dsh", "work", "dsh-msys2", "dsh-msys2");
+            try
+            {
+                Directory.CreateDirectory(repo);
+
+                WithEnvironment(new Dictionary<string, string>
+                    {
+                        { "GITHUB_WORKSPACE", null },
+                        { "LOCALAPPDATA", local },
+                    },
+                    delegate
+                    {
+                        Assert.AreEqual(Path.GetFullPath(repo), Msys2Discovery.CheckoutDirectory(),
+                            "the machine's own GitHub Actions root must be reconstructed");
+                    });
+            }
+            finally { TestScratch.Cleanup(local); }
+        }
+
+        [TestMethod]
+        public void CheckoutDirectoryFallsBackToTheWorkingDirectory()
+        {
+            // With no runner variables at all — an ordinary `dsh shell` — the
+            // repository root is still identifiable, because the working
+            // directory is inside it. Without this fallback the "a .env below
+            // the checkout root is ignored" rule would silently do nothing off
+            // CI, which is where most runs happen.
+            string local = TestScratch.NewDirectory("localappdata-none");
+            try
+            {
+                WithEnvironment(new Dictionary<string, string>
+                    {
+                        { "GITHUB_WORKSPACE", null },
+                        { "LOCALAPPDATA", local },
+                    },
+                    delegate
+                    {
+                        string checkout = Msys2Discovery.CheckoutDirectory();
+                        Assert.IsNotNull(checkout, "the repository root must be found from the working directory");
+                        Assert.IsTrue(File.Exists(Path.Combine(checkout, "build.cmd")),
+                            "the derived checkout must be this repository: " + checkout);
+                    });
+            }
+            finally { TestScratch.Cleanup(local); }
+        }
+
+        [TestMethod]
+        public void CheckoutDirectoryNeverInventsAPathOutsideTheRepository()
+        {
+            // The fallback must be anchored to a real checkout. A directory
+            // that is not inside one must not be reported as a checkout, since
+            // that would make the ignore rule point at an unrelated place.
+            //
+            // This has to run from somewhere genuinely outside the repository.
+            // The scratch tree will not do: it lives under the workspace, so
+            // walking up from it correctly finds the real checkout.
+            string stray = Path.Combine(Path.GetTempPath(), "not-a-repo-" + Guid.NewGuid().ToString("N"));
+            string local = TestScratch.NewDirectory("localappdata-stray");
+            Directory.CreateDirectory(stray);
+            try
+            {
+                string saved = Directory.GetCurrentDirectory();
+                try
+                {
+                    Directory.SetCurrentDirectory(stray);
+
+                    WithEnvironment(new Dictionary<string, string>
+                        {
+                            { "GITHUB_WORKSPACE", null },
+                            { "LOCALAPPDATA", local },
+                        },
+                        delegate
+                        {
+                            Assert.IsNull(Msys2Discovery.CheckoutDirectory(),
+                                "a directory that is not a checkout must not be reported as one");
+                        });
+                }
+                finally { Directory.SetCurrentDirectory(saved); }
+            }
+            finally
+            {
+                TestScratch.Cleanup(stray);
+                TestScratch.Cleanup(local);
+            }
+        }
+
+        [TestMethod]
+        public void CheckoutRootLeadsTheConfigFileCandidates()
+        {
+            string workspace = TestScratch.NewDirectory("candidates");
+            try
+            {
+                WithEnvironment(new Dictionary<string, string> { { "GITHUB_WORKSPACE", workspace } },
+                    delegate
+                    {
+                        List<string> candidates = Msys2Discovery.ConfigFileCandidates();
+                        Assert.IsTrue(candidates.Count > 0, "there must be somewhere to look for .env");
+
+                        bool sawRoot = false;
+                        foreach (string candidate in candidates)
+                            if (string.Equals(candidate, Path.Combine(workspace, ".env"),
+                                StringComparison.OrdinalIgnoreCase)) sawRoot = true;
+
+                        Assert.IsTrue(sawRoot,
+                            "the checkout root's .env must be a candidate: "
+                            + string.Join(", ", candidates.ToArray()));
+                    });
+            }
+            finally { TestScratch.Cleanup(workspace); }
+        }
+
+        [TestMethod]
+        public void SavedRootIsReadBackAndExistingContentIsPreserved()
+        {
+            // Browse must be a one-time cost, so a saved pick has to round-trip.
+            string dir = TestScratch.NewDirectory("save");
+            string msys = DiscoveryTests.MakeFakeMsysRoot("save-root");
+            try
+            {
+                string shellCmd = Path.Combine(msys, "msys2_shell.cmd");
+                string file = Path.Combine(dir, ".env");
+
+                File.WriteAllText(file, "# keep me\nUNRELATED=1\nDSH_MSYS2_ROOT=C:\\stale\n");
+                string written = DshConfig.WriteRootTo(file, shellCmd);
+                Assert.AreEqual(file, written, "the existing .env is the file to update");
+
+                string text = File.ReadAllText(file);
+                Assert.Contains("# keep me", text, "comments must survive a save");
+                Assert.Contains("UNRELATED=1", text, "unrelated keys must survive a save");
+                Assert.DoesNotContain("C:\\stale", text, "the old value must be replaced");
+                Assert.Contains(Path.GetDirectoryName(shellCmd), text, "the new root must be written");
+
+                Dictionary<string, string> values = Msys2Discovery.ParseEnvFile(file);
+                Assert.AreEqual(Path.GetDirectoryName(shellCmd), values["DSH_MSYS2_ROOT"],
+                    "the saved value must read back as the install root");
+            }
+            finally
+            {
+                Directory.Delete(msys, true);
+                TestScratch.Cleanup(dir);
+            }
+        }
+
+        [TestMethod]
+        public void SavingCreatesTheFileWhenItIsAbsent()
+        {
+            string dir = TestScratch.NewDirectory("save-new");
+            string msys = DiscoveryTests.MakeFakeMsysRoot("save-new-root");
+            try
+            {
+                string shellCmd = Path.Combine(msys, "msys2_shell.cmd");
+                string file = Path.Combine(dir, ".env");
+
+                Assert.AreEqual(file, DshConfig.WriteRootTo(file, shellCmd), "the file must be created");
+                Assert.IsTrue(File.Exists(file), "the file must exist after a save");
+                Assert.AreEqual(Path.GetDirectoryName(shellCmd),
+                    Msys2Discovery.ParseEnvFile(file)["DSH_MSYS2_ROOT"],
+                    "a created file must still carry the root");
+            }
+            finally
+            {
+                Directory.Delete(msys, true);
+                TestScratch.Cleanup(dir);
+            }
+        }
+    }
+
+    [TestClass]
+    public sealed class PathDiscoveryIntegrationTests
+    {
+        [TestMethod]
+        public void TheConfiguredInstallOnThisMachineIsDiscovered()
+        {
+            // This machine's MSYS2 is named either by a git-ignored .env or by
+            // DSH_MSYS2_ROOT. Both are mandatory: CI installs MSYS2 into the
+            // workspace, and no property of the machine itself can be assumed
+            // here. The old version of this test hard-coded
+            // %USERPROFILE%\Downloads\msys64 and so failed on every runner.
+            string configured = Msys2Discovery.ExplicitRoot();
+
+            if (configured == null)
+            {
+                throw new SkipException(
+                    "no MSYS2 configured: set DSH_MSYS2_ROOT or write "
+                    + Msys2Discovery.EnvFileName + ". Looked at "
+                    + string.Join(", ", Msys2Discovery.ConfigFileCandidates().ToArray()));
+            }
+
+            Assert.IsNull(Msys2Discovery.Validate(configured),
+                "the configured install must validate: " + configured);
+        }
+
+        [TestMethod]
+        public void TheConfiguredInstallIsTheOneGuessReturns()
+        {
+            // Configuration must outrank PATH. Otherwise a machine with a spare
+            // msys2_shell.cmd on PATH would silently install presets pointing
+            // at the wrong tree.
+            string configured = Msys2Discovery.ExplicitRoot();
+            if (configured == null)
+                throw new SkipException("no MSYS2 configured; see the .env example in the README");
+
             string guessed = Msys2Discovery.Guess();
-            Assert.IsNotNull(guessed, "discovery should find MSYS2 on this machine");
+            Assert.IsNotNull(guessed, "discovery should find the configured MSYS2");
+            Assert.AreEqual(configured, guessed, "the configured install must win over PATH");
+            Assert.IsNull(Msys2Discovery.Validate(guessed), "the guessed path must be valid: " + guessed);
+        }
+
+        [TestMethod]
+        public void GuessFindsAnInstallOnThisMachine()
+        {
+            // The weak form, and the one that holds on any machine: SOMETHING
+            // must be discoverable, or the installer cannot work at all.
+            string guessed = Msys2Discovery.Guess();
+            if (guessed == null)
+                throw new SkipException("no MSYS2 install found on this machine:\n"
+                    + Msys2Discovery.DescribeFailure());
+
             Assert.IsNull(Msys2Discovery.Validate(guessed), "the guessed path must be valid: " + guessed);
         }
     }

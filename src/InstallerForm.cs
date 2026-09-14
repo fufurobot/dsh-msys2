@@ -251,6 +251,14 @@ namespace Dsh.Msys2Installer
                 {
                     _shellCmdBox.Text = dialog.FileName;
                     Log("Selected: " + dialog.FileName);
+
+                    // Remember the pick, so Browse is a one-time cost rather
+                    // than something to repeat on every run.
+                    if (Msys2Discovery.Validate(dialog.FileName) == null)
+                    {
+                        string saved = DshConfig.SaveMsys2Root(dialog.FileName);
+                        if (saved != null) Log("Recorded in " + saved);
+                    }
                     Revalidate();
                 }
             }
@@ -407,11 +415,12 @@ namespace Dsh.Msys2Installer
         private static int RunHeadless(string[] args)
         {
             string shellCmd = null;
+            bool explicitShellCmd = false;
             var keys = new List<string>();
 
             for (int i = 1; i < args.Length; i++)
             {
-                if (args[i] == "--shell-cmd" && i + 1 < args.Length) shellCmd = args[++i];
+                if (args[i] == "--shell-cmd" && i + 1 < args.Length) { shellCmd = args[++i]; explicitShellCmd = true; }
                 else if (args[i] == "--flavour" && i + 1 < args.Length) keys.Add(args[++i]);
             }
 
@@ -428,7 +437,18 @@ namespace Dsh.Msys2Installer
             if (reason != null)
             {
                 Console.Error.WriteLine("error: " + reason);
+                Console.Error.WriteLine();
+                Console.Error.WriteLine(Msys2Discovery.DescribeFailure());
                 return 1;
+            }
+
+            // An explicit --shell-cmd is a decision the user made; record it so
+            // the next run finds the same install without being told again.
+            if (explicitShellCmd)
+            {
+                string saved = DshConfig.SaveMsys2Root(shellCmd);
+                Console.WriteLine("recorded " + DshConfig.RootKey + " in "
+                    + (saved ?? "(nowhere: no writable " + Msys2Discovery.EnvFileName + ")"));
             }
 
             var chosen = new List<Msys2Flavour>();

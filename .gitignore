@@ -37,7 +37,18 @@ ScaffoldingReadMe.txt
 *.snupkg
 
 # dotenv environment variables file
+#
+# This is where the installer remembers which MSYS2 install is yours, so it is
+# deliberately ignored: the choice is per-machine, never per-repository. See
+# .env.example for the keys. .env.example itself IS tracked, because it is
+# documentation rather than configuration.
 .env
+!.env.example
+.env.local
+.env.*.local
+
+# Test scratch space (created by the suite under the working directory)
+test-scratch/
 
 # Others
 ~$*

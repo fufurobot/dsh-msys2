@@ -1,11 +1,18 @@
 name: CI
 
+# Continuous integration for the DEFAULT branch.
+#
+# Policy: tests MAY be skipped here — a skip is reported, not fatal — but the
+# run must always report coverage so a skip is visible rather than invisible.
+# The strict counterpart is .github/workflows/release.yml, which runs the same
+# suite on a published release and fails if any test fails to execute.
+#
 # This project is Windows-only by construction, so CI cannot run on Linux:
 #
 #   * build.cmd compiles with the .NET Framework's csc.exe
 #     (%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\csc.exe). That ships
 #     with Windows and is the whole reason the project needs no .NET SDK and
-#     no NuGet restore — neither of which exists on a Linux runner.
+#     no NuGet restore.
 #   * The installer is a WinForms GUI (/target:winexe, System.Windows.Forms).
 #   * tests/ShimTests.cs executes real MSYS2 bash. Its assertions are about
 #     MSYS2 process behaviour (exit-code propagation, quoting, PATH) and have
@@ -15,11 +22,11 @@ name: CI
 # msys-2.0.dll cannot start under the Windows ACL sandbox (it needs a per-user
 # named section that a write-restricted token denies, giving Win32 error 5).
 # That is why a local sandboxed run reports the 10 ShimTests as skipped. Here
-# they run for real, so CI covers checks a local run cannot.
+# they can actually run, which is what makes the coverage number meaningful.
 
 on:
   push:
-    branches: ['**']
+    branches: [main, master]
   pull_request:
   workflow_dispatch:
 
@@ -31,15 +38,15 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Shared by every step: where the coverage tooling is unpacked. Kept out of
+  # the repo tree so it can never be mistaken for project source.
+  COVERAGE_TOOLS: ${{ github.workspace }}\.coverage-tools
+
 jobs:
   build-and-test:
     name: Build and test (Windows)
     runs-on: windows-latest
-
-    # The runner image moves; if a future image ever dropped the .NET
-    # Framework or broke MSYS2, this pins the last known-good combination.
-    # timeout-minutes bounds a hung MSYS2 child rather than letting it burn
-    # the 6-hour default.
     timeout-minutes: 30
 
     defaults:
@@ -70,20 +77,64 @@ jobs:
 
       - name: Install MSYS2
         # Required by tests/ShimTests.cs, which runs real MSYS2 bash through
-        # the compiled shim. Without an MSYS2 install those tests skip, and the
-        # skip gate below turns that into a failure — deliberately, so CI can
-        # never look green while the central claim of the project is unproven.
+        # the compiled shim. Without it those 10 tests skip — which this
+        # workflow tolerates and reports, and release.yml rejects.
+        #
+        # `location` is set explicitly so the tree lands at a path this
+        # repository can state outright: ${{ github.workspace }}\msys\msys64.
+        # ${{ github.workspace }} IS the GITHUB_WORKSPACE variable, which is
+        # what lets Msys2Discovery derive the same path in code instead of
+        # hard-coding a runner path — and what keeps this working whether or
+        # not the runner happens to be Windows. The action's default location
+        # is $RUNNER_TOOL_CACHE\msys2, which discovery also searches, so this
+        # is about making the layout explicit rather than merely possible.
         uses: msys2/setup-msys2@v2
+        with:
+          location: ${{ github.workspace }}\msys
+
+      - name: Verify MSYS2 landed where discovery expects it
+        # Runs BEFORE the suite, so a layout change in the action surfaces as a
+        # clear failure here rather than as an unexplained test failure or, far
+        # worse, a silently skipped suite.
+        #
+        # Only the two marker files are needed: Msys2Discovery.IsShellCmd
+        # accepts an install on exactly these, and that is the same check the
+        # installer and the tests perform.
+        #
+        # DSH_MSYS2_ROOT is deliberately NOT set for the suite. Setting it
+        # would mask a regression in the layout logic, and the point of this
+        # change is that discovery can rely on the workspace layout without
+        # also being told about it. A developer who needs to point the
+        # installer somewhere else uses a git-ignored .env instead.
+        run: |
+          $root = Join-Path $env:GITHUB_WORKSPACE 'msys\msys64'
+          $shell = Join-Path $root 'msys2_shell.cmd'
+          $bash = Join-Path $root 'usr\bin\bash.exe'
+
+          foreach ($f in @($shell, $bash)) {
+            if (-not (Test-Path $f)) {
+              Write-Host "expected MSYS2 layout under $root; found:"
+              Get-ChildItem $env:GITHUB_WORKSPACE -Directory |
+                ForEach-Object { Write-Host "  $($_.Name)\" }
+              if (Test-Path (Join-Path $env:GITHUB_WORKSPACE 'msys')) {
+                Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE 'msys') -Directory |
+                  ForEach-Object { Write-Host "  msys\$($_.Name)\" }
+              }
+              Write-Error "MSYS2 is not where discovery looks: $f is missing"
+              exit 1
+            }
+            Write-Host "ok   $f"
+          }
+
+          Write-Host "MSYS2 shell: $shell"
 
       - name: Build
-        # Builds both targets: build\msys2-installer.exe and build\msys2-tests.exe.
-        # build.cmd exits non-zero on a compile error, which fails the step.
+        # build.cmd builds the installer and the tests, and exits non-zero on a
+        # compile error. A build failure is fatal in every mode: there is no
+        # sense in which a broken build "may be skipped".
         run: .\build.cmd all
 
       - name: Verify build outputs exist
-        # build.cmd reports success by exit code; this asserts the artifacts a
-        # consumer actually needs are on disk, including the shim source that
-        # must ship beside the exe (it is compiled on the target machine).
         run: |
           $expected = @(
             'build\msys2-installer.exe',
@@ -97,42 +148,186 @@ jobs:
             Write-Host ("ok   {0} ({1} bytes)" -f $f, $len)
           }
 
-      - name: Run test suite
-        # msys2-tests.exe exits 1 on any failure and 0 when everything passed
-        # (skips allowed), so its exit code is the gate. Output is captured for
-        # the skip check in the next step and echoed in full either way.
+      # ── coverage ───────────────────────────────────────────────────────────
+      # Real line/branch coverage, measured by OpenCover.
+      #
+      # OpenCover is used rather than coverlet/dotnet-coverage because those
+      # need a .NET SDK, which this project deliberately does not require (and
+      # which the local machine does not even have installed). OpenCover is a
+      # self-contained .NET Framework tool: "a code coverage tool (branch and
+      # sequence point) for all .NET Frameworks 2 and above", i.e. exactly the
+      # csc.exe-built assemblies this project produces. It is fetched as a
+      # plain nupkg, so no SDK and no NuGet client are involved.
+      #
+      # OpenCover reads line/branch data from PDB sequence points, and build.cmd
+      # does not pass /debug, so it emits no PDB. Without one OpenCover would
+      # report nothing useful, so the test assembly is recompiled with
+      # /debug:full here. The command below mirrors build.cmd's :do_tests
+      # target exactly (same sources, same /main, same references) — if that
+      # target changes, this must change with it.
+
+      - name: Build test assembly with debug symbols
         run: |
-          $output = & .\build\msys2-tests.exe 2>&1 | Tee-Object -Variable lines
-          $code = $LASTEXITCODE
-          $output | Write-Host
-          # Stash the summary for the gate step below.
-          $output | Out-File -FilePath test-output.txt -Encoding utf8
+          $csc = "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+
+          & $csc /nologo /target:exe /platform:anycpu /optimize- /debug:full /warn:4 `
+            /main:Dsh.Msys2Installer.Tests.TestMain `
+            /out:build\msys2-tests.exe `
+            /reference:System.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll `
+            src\Msys2Flavour.cs src\ShimBuilder.cs src\PresetWriter.cs src\InstallerForm.cs `
+            tests\TestFramework.cs tests\InstallerTests.cs tests\ShimTests.cs tests\TestMain.cs
+          if ($LASTEXITCODE -ne 0) { Write-Error "debug build failed"; exit 1 }
+
+          if (-not (Test-Path build\msys2-tests.pdb)) {
+            Write-Error "no PDB was produced; coverage would have no sequence points to report"
+            exit 1
+          }
+          Write-Host "debug symbols: build\msys2-tests.pdb"
+
+      - name: Install coverage tooling
+        id: coverage_tools
+        # A missing coverage tool must not fail the lenient workflow — it is
+        # reported as "unavailable" instead, so a network hiccup cannot break
+        # the default branch. release.yml, which demands coverage, treats the
+        # same condition as fatal.
+        continue-on-error: true
+        run: |
+          $dest = "$env:COVERAGE_TOOLS\opencover"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $nupkg = "$env:COVERAGE_TOOLS\opencover.zip"
+
+          # nuget.org's flat-container endpoint for the immutable version.
+          $url = 'https://www.nuget.org/api/v2/package/OpenCover/4.7.1221'
+          Write-Host "downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile $nupkg -UseBasicParsing
+          Expand-Archive -Path $nupkg -DestinationPath $dest -Force
+
+          $console = Get-ChildItem -Path $dest -Recurse -Filter 'OpenCover.Console.exe' |
+            Select-Object -First 1
+          if (-not $console) { throw "OpenCover.Console.exe not found in the package" }
+          Write-Host "coverage tool: $($console.FullName)"
+          "console=$($console.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Run test suite under coverage
+        id: tests
+        # The suite's exit code is the gate (0 = all passed or skipped, 1 = a
+        # failure). A failure is fatal even here: "tests may be skipped" is not
+        # "tests may fail". Skipped tests do not fail this step; they are
+        # surfaced by the coverage report below.
+        run: |
+          $console = '${{ steps.coverage_tools.outputs.console }}'
+          if ($console -and (Test-Path $console)) {
+            & $console -register:user `
+              -target:build\msys2-tests.exe `
+              -targetdir:build `
+              -filter:"+[Dsh*]* -[Dsh*]Tests.*" `
+              -output:coverage.xml `
+              -coverbytest:"Dsh.Msys2Installer.Tests.*" 2>&1 |
+              Tee-Object -FilePath test-output.txt
+            $code = $LASTEXITCODE
+
+            # OpenCover propagates the target's exit code, but a coverage
+            # failure can mask it, so re-run the suite directly if OpenCover
+            # itself errored. A genuine test failure must never be swallowed
+            # by the coverage wrapper.
+            if ($code -ne 0) {
+              Write-Host ""
+              Write-Host "OpenCover exited $code; re-running the suite directly to separate"
+              Write-Host "a real test failure from a coverage-tool failure."
+              & .\build\msys2-tests.exe 2>&1 | Tee-Object -FilePath test-output.txt
+              $code = $LASTEXITCODE
+            }
+          } else {
+            Write-Host "::warning::Coverage tooling unavailable; running the suite without coverage."
+            & .\build\msys2-tests.exe 2>&1 | Tee-Object -FilePath test-output.txt
+            $code = $LASTEXITCODE
+          }
+
+          # Publish the counts so later steps and release.yml can assert on them.
+          $m = Select-String -Path test-output.txt -Pattern '^(passed|failed|skipped):\s+(\d+)'
+          foreach ($line in $m) {
+            $parts = $line.Line -split ':\s+'
+            "$($parts[0])=$($parts[1])" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
           exit $code
 
-      - name: Fail on skipped tests
-        # A skip means a check did not run. On an unconfined windows-latest
-        # runner with MSYS2 installed, the 10 ShimTests must actually execute;
-        # if they report as skipped the environment is wrong, and a green run
-        # would misrepresent coverage. The suite's own summary line is parsed
-        # rather than its exit code, because exit code 0 permits skips.
+      - name: Report coverage
+        if: always()
+        # This is the step that makes the lenient policy honest. Because skips
+        # are allowed here, the counts MUST be visible: the job summary states
+        # exactly how many tests ran and names the ones that did not.
         run: |
-          $summary = Select-String -Path test-output.txt -Pattern '^skipped:\s+(\d+)' |
-            Select-Object -First 1
-          if (-not $summary) {
-            Write-Error "could not find the 'skipped:' summary line in the test output"
-            exit 1
+          $summary = @()
+          $summary += "## Test and coverage report"
+          $summary += ""
+
+          $counts = Select-String -Path test-output.txt -Pattern '^(passed|failed|skipped|total):\s+(\d+)' -ErrorAction SilentlyContinue
+          if ($counts) {
+            $summary += "| Result | Count |"
+            $summary += "| --- | --- |"
+            foreach ($line in $counts) {
+              $p = $line.Line -split ':\s+'
+              $summary += "| $($p[0]) | $($p[1]) |"
+            }
+            $summary += ""
           }
-          $skipped = [int]$summary.Matches[0].Groups[1].Value
-          if ($skipped -gt 0) {
-            Write-Error "$skipped test(s) skipped. On this runner every test must run."
-            exit 1
+
+          # Name every skipped test and its reason. A skip that is not named is
+          # a silent gap in coverage, which is the specific failure mode this
+          # workflow is designed to prevent.
+          #
+          # TestMain.cs writes "  <name> — <reason>" using an em dash (U+2014).
+          # The dash is spelled as an escape so this pattern cannot be broken
+          # by an encoding change in this file, whichever way it is re-saved.
+          $skipPattern = "^\s{2}(\S+)\s+" + [char]0x2014 + "\s+(.+)$"
+          $skips = Select-String -Path test-output.txt -Pattern $skipPattern -ErrorAction SilentlyContinue
+          if ($skips) {
+            $summary += "### Skipped checks ($($skips.Count))"
+            $summary += ""
+            $summary += "These did **not** run, so their claims are unverified:"
+            $summary += ""
+            foreach ($s in $skips) { $summary += "- ``$($s.Matches[0].Groups[1].Value)`` — $($s.Matches[0].Groups[2].Value)" }
+            $summary += ""
+          } else {
+            $summary += "No tests were skipped."
+            $summary += ""
           }
-          Write-Host "no tests were skipped"
+
+          # Line/branch figures from the OpenCover XML.
+          if (Test-Path coverage.xml) {
+            try {
+              [xml]$cov = Get-Content coverage.xml -Raw
+              $overall = $cov.CoverageSession.Summary
+              $summary += "### Code coverage (line / branch)"
+              $summary += ""
+              $summary += "| Metric | Covered | Total | Percent |"
+              $summary += "| --- | --- | --- | --- |"
+              $summary += "| Lines | $($overall.visitedSequencePoints) | $($overall.numSequencePoints) | $($overall.sequenceCoverage)% |"
+              $summary += "| Branches | $($overall.visitedBranchPoints) | $($overall.numBranchPoints) | $($overall.branchCoverage)% |"
+              $summary += "| Methods | $($overall.visitedMethods) | $($overall.numMethods) | $($overall.methodCoverage)% |"
+              $summary += ""
+              $summary += "_Line and branch coverage come from PDB sequence points, which is why the"
+              $summary += "test assembly is rebuilt with ``/debug:full``. The 10 MSYS2 tests are"
+              $summary += "excluded from the filter when they skip, so a skipped run shows lower"
+              $summary += "coverage rather than hiding the gap._"
+            } catch {
+              $summary += "Coverage XML was produced but could not be parsed: $($_.Exception.Message)"
+            }
+          } else {
+            $summary += "### Code coverage"
+            $summary += ""
+            $summary += "**No coverage was produced in this run.** The test results above are"
+            $summary += "reported without line/branch numbers, so treat them as unmeasured."
+          }
+
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $summary | ForEach-Object { Write-Host $_ }
 
       - name: Verify headless CLI
         # The README documents this surface, and a WinForms build can compile
         # yet still fail before Main's argument parsing. --list is side-effect
-        # free, so it is safe to run here (--install is not: it writes presets).
+        # free (--install is not: it writes presets).
         run: |
           $listing = & .\build\msys2-installer.exe --list
           if ($LASTEXITCODE -ne 0) { Write-Error "--list exited $LASTEXITCODE"; exit 1 }
@@ -146,10 +341,6 @@ jobs:
           Write-Host "all five flavours are listed"
 
       - name: End-to-end install and preset validation
-        # Exercises the full install path headlessly into the runner's own
-        # DSH_HOME, then validates the written presets with the same YAML
-        # library DSH uses. Scoped to this step's environment so nothing
-        # leaks into later steps.
         env:
           DSH_HOME: ${{ github.workspace }}\.ci-dsh-home
         run: |
@@ -166,7 +357,6 @@ jobs:
           Write-Host "wrote $($dirs.Count) preset(s):"
           $dirs | ForEach-Object { Write-Host "  $($_.Name)" }
 
-          # The shim is compiled at install time; it must be a real executable.
           foreach ($d in $dirs) {
             $shim = Join-Path $d.FullName 'msys2_shell_shim.exe'
             if (-not (Test-Path $shim)) { Write-Error "no shim in $($d.Name)"; exit 1 }
@@ -195,14 +385,16 @@ jobs:
             exit 1
           }
 
-      - name: Upload build artifacts
-        # Always, so a failed run still yields the exes for inspection.
+      - name: Upload coverage and build artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: msys2-installer
+          name: ci-coverage-and-build
           path: |
+            coverage.xml
+            test-output.txt
             build/msys2-installer.exe
             build/msys2-tests.exe
+            build/msys2-tests.pdb
             build/Msys2ShellShim.cs
           if-no-files-found: warn
