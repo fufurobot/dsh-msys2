@@ -1291,6 +1291,135 @@ namespace Dsh.Msys2Installer.Tests
     }
 
     [TestClass]
+    public sealed class HeadlessCliTests
+    {
+        /// <summary>Locate a build output by walking up to the repo root.</summary>
+        private static string BuildOutput(string name)
+        {
+            string dir = Directory.GetCurrentDirectory();
+            while (!string.IsNullOrEmpty(dir))
+            {
+                string candidate = Path.Combine(dir, "build", name);
+                if (File.Exists(candidate)) return candidate;
+
+                DirectoryInfo parent = Directory.GetParent(dir);
+                if (parent == null) break;
+                dir = parent.FullName;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// The PE subsystem field: 2 = Windows GUI, 3 = console.
+        ///
+        /// This is read straight from the header because it is the WHOLE
+        /// problem: a GUI-subsystem process has no console and its exit code
+        /// cannot be observed by a caller, so it cannot serve as a CLI no
+        /// matter what it writes to Console.Out.
+        /// </summary>
+        private static int PeSubsystem(string path)
+        {
+            byte[] bytes = File.ReadAllBytes(path);
+            int peOffset = BitConverter.ToInt32(bytes, 0x3C);
+            return BitConverter.ToUInt16(bytes, peOffset + 0x5C);
+        }
+
+        /// <summary>Run a CLI command and give back its output and exit code.</summary>
+        private static int Run(string arguments, out string stdout)
+        {
+            string cli = BuildOutput("msys2-installer-cli.exe");
+            if (cli == null)
+                throw new SkipException("build\\msys2-installer-cli.exe has not been built");
+
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = cli;
+            psi.Arguments = arguments;
+            psi.UseShellExecute = false;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            psi.CreateNoWindow = true;
+
+            using (System.Diagnostics.Process p = System.Diagnostics.Process.Start(psi))
+            {
+                stdout = p.StandardOutput.ReadToEnd();
+                p.StandardError.ReadToEnd();
+                p.WaitForExit();
+                return p.ExitCode;
+            }
+        }
+
+        [TestMethod]
+        public void TheHeadlessCliIsAConsoleBinary()
+        {
+            // Regression guard for the CI failure where "Verify headless CLI"
+            // died with "--list exited " and a blank code: the check ran the
+            // winexe, whose exit code PowerShell reports as empty, making
+            // `$LASTEXITCODE -ne 0` true even on success.
+            string cli = BuildOutput("msys2-installer-cli.exe");
+            if (cli == null)
+                throw new SkipException("build\\msys2-installer-cli.exe has not been built");
+
+            Assert.AreEqual(3, PeSubsystem(cli),
+                "the headless CLI must be a CONSOLE subsystem binary (3), not a winexe (2)");
+        }
+
+        [TestMethod]
+        public void TheGuiInstallerRemainsAWindowsBinary()
+        {
+            // The converse: the GUI must stay a winexe, or double-clicking it
+            // would flash a console window.
+            string gui = BuildOutput("msys2-installer.exe");
+            if (gui == null)
+                throw new SkipException("build\\msys2-installer.exe has not been built");
+
+            Assert.AreEqual(2, PeSubsystem(gui),
+                "the GUI installer must stay a winexe (subsystem 2)");
+        }
+
+        [TestMethod]
+        public void TheHeadlessCliListsEveryFlavourAndExitsZero()
+        {
+            // The exact contract CI depends on: capturable stdout AND a real
+            // exit code. Both are asserted, because `--list` printing correctly
+            // while returning a broken code is precisely the old failure.
+            string stdout;
+            int exitCode = Run("--list", out stdout);
+
+            Assert.AreEqual(0, exitCode, "--list must exit 0; output was:\n" + stdout);
+
+            foreach (Msys2Flavour flavour in Msys2Flavours.All)
+            {
+                Assert.IsTrue(stdout.IndexOf(flavour.Key, StringComparison.Ordinal) >= 0,
+                    flavour.Key + " is missing from --list output:\n" + stdout);
+                Assert.IsTrue(stdout.IndexOf(flavour.PresetId, StringComparison.Ordinal) >= 0,
+                    flavour.PresetId + " is missing from --list output:\n" + stdout);
+            }
+        }
+
+        [TestMethod]
+        public void TheHeadlessCliRejectsAnUnknownCommand()
+        {
+            // A wrong command must fail loudly rather than silently exit 0,
+            // because a script asserting on the exit code is the whole point.
+            string stdout;
+            int exitCode = Run("--definitely-not-a-command", out stdout);
+
+            Assert.AreNotEqual(0, exitCode, "an unknown command must exit non-zero");
+        }
+
+        [TestMethod]
+        public void TheHeadlessCliPrintsUsageWithoutArguments()
+        {
+            string stdout;
+            int exitCode = Run("", out stdout);
+
+            Assert.AreNotEqual(0, exitCode, "running with no command must exit non-zero");
+            Assert.IsTrue(stdout.IndexOf("usage", StringComparison.OrdinalIgnoreCase) >= 0,
+                "usage text should be printed:\n" + stdout);
+        }
+    }
+
+    [TestClass]
     public sealed class PathDiscoveryIntegrationTests
     {
         [TestMethod]

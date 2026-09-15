@@ -57,7 +57,10 @@ exit /b 0
 
 :do_installer
 echo [build] compiling installer...
+rem /main picks the GUI entry point: InstallerForm.cs also carries the headless
+rem CLI's entry point, because the two share all of their logic.
 "%CSC%" /nologo /target:winexe /platform:anycpu /optimize+ /warn:4 ^
+  /main:Dsh.Msys2Installer.Program ^
   /out:"%OUT%\msys2-installer.exe" ^
   /reference:System.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll ^
   "%SRC%\Msys2Flavour.cs" "%SRC%\ShimBuilder.cs" "%SRC%\PresetWriter.cs" "%SRC%\InstallerForm.cs"
@@ -65,9 +68,25 @@ if errorlevel 1 (
   echo [build] ERROR: installer build failed.
   exit /b 1
 )
+
+rem The headless CLI is a SEPARATE, console-subsystem binary. A winexe cannot
+rem report an exit code, and its stdout cannot be captured, so a script cannot
+rem assert on `msys2-installer.exe --list`. Same sources; /main picks the CLI
+rem entry point, exactly as :do_tests picks the test runner.
+echo [build] compiling headless CLI...
+"%CSC%" /nologo /target:exe /platform:anycpu /optimize+ /warn:4 ^
+  /main:Dsh.Msys2Installer.ProgramCli ^
+  /out:"%OUT%\msys2-installer-cli.exe" ^
+  /reference:System.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll ^
+  "%SRC%\Msys2Flavour.cs" "%SRC%\ShimBuilder.cs" "%SRC%\PresetWriter.cs" "%SRC%\InstallerForm.cs"
+if errorlevel 1 (
+  echo [build] ERROR: headless CLI build failed.
+  exit /b 1
+)
 rem The shim is compiled on the target machine, so ship its source beside the exe.
 copy /y "%SRC%\Msys2ShellShim.cs" "%OUT%\Msys2ShellShim.cs" >nul
 echo [build]   %OUT%\msys2-installer.exe
+echo [build]   %OUT%\msys2-installer-cli.exe
 exit /b 0
 
 :do_tests

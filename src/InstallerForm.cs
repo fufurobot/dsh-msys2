@@ -394,42 +394,69 @@ namespace Dsh.Msys2Installer
         [STAThread]
         private static int Main(string[] args)
         {
-            // A headless mode, so the installer can be exercised from a script
-            // and from the test harness without opening a window.
-            //
-            //   msys2-installer.exe --install --shell-cmd <path> [--flavour k]...
-            //   msys2-installer.exe --list
-            if (args.Length > 0 && (args[0] == "--install" || args[0] == "--list"))
-                return RunHeadless(args);
-
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new InstallerForm());
             return 0;
         }
+    }
 
-        /// <summary>
-        /// Drive an install without the GUI. Prints a report and returns 0 on
-        /// success, 1 on failure — so a caller can assert on it.
-        /// </summary>
-        private static int RunHeadless(string[] args)
+    /// <summary>
+    /// The headless entry point, compiled into its own /target:exe binary.
+    ///
+    /// WHY THIS IS A SEPARATE PROGRAM
+    ///
+    /// msys2-installer.exe is /target:winexe, i.e. PE subsystem 2 (Windows
+    /// GUI). Such a process has no console of its own, and — critically — the
+    /// parent CANNOT OBSERVE ITS EXIT CODE. Measured on this repository:
+    /// a winexe whose Main returns 7 leaves PowerShell's $LASTEXITCODE at 0,
+    /// or empty. Console.Out is discarded too, and AttachConsole() cannot fix
+    /// the exit-code half, because the subsystem decision was made when the
+    /// image was linked.
+    ///
+    /// That is exactly what broke CI. The "Verify headless CLI" step ran
+    /// `msys2-installer.exe --list`, got an EMPTY $LASTEXITCODE, and then
+    /// evaluated `$LASTEXITCODE -ne 0`, which is `$null -ne 0` — true — and
+    /// failed with the message "--list exited " and no number.
+    ///
+    /// A GUI binary legitimately cannot serve as a CLI, so the CLI is built as
+    /// a console-subsystem binary (/target:exe) that shares every line of the
+    /// installer's logic. It prints to stdout normally and returns a real exit
+    /// code, so scripts can assert on it.
+    /// </summary>
+    internal static class ProgramCli
+    {
+        private static int Main(string[] args)
         {
             string shellCmd = null;
             bool explicitShellCmd = false;
             var keys = new List<string>();
+            var rest = new List<string>();
+
+            string command = args.Length > 0 ? args[0] : null;
 
             for (int i = 1; i < args.Length; i++)
             {
                 if (args[i] == "--shell-cmd" && i + 1 < args.Length) { shellCmd = args[++i]; explicitShellCmd = true; }
                 else if (args[i] == "--flavour" && i + 1 < args.Length) keys.Add(args[++i]);
+                else rest.Add(args[i]);
             }
 
-            if (args[0] == "--list")
+            if (command == null || command == "--help" || command == "-h")
+                return Usage(command == null ? 1 : 0);
+
+            if (command == "--list")
             {
                 foreach (Msys2Flavour flavour in Msys2Flavours.All)
                     Console.WriteLine(flavour.Key + "\t" + flavour.Msystem + "\t" + flavour.PresetId
                         + "\t" + flavour.Label);
                 return 0;
+            }
+
+            if (command != "--install")
+            {
+                Console.Error.WriteLine("error: unknown command \"" + command + "\"");
+                return Usage(1);
             }
 
             if (shellCmd == null) shellCmd = Msys2Discovery.Guess();
@@ -455,10 +482,19 @@ namespace Dsh.Msys2Installer
             foreach (Msys2Flavour flavour in Msys2Flavours.All)
                 if (keys.Count == 0 || keys.Contains(flavour.Key)) chosen.Add(flavour);
 
+            if (chosen.Count == 0)
+            {
+                Console.Error.WriteLine("error: no flavour matched "
+                    + string.Join(", ", keys.ToArray()));
+                return 1;
+            }
+
             try
             {
                 string presetRoot = DshPaths.PresetRoot();
+                Console.WriteLine("msys2 shell: " + shellCmd);
                 Console.WriteLine("preset root: " + presetRoot);
+
                 foreach (InstallResult result in PresetWriter.InstallAll(
                     chosen, shellCmd, presetRoot,
                     delegate(Msys2Flavour f, int i, int n)
@@ -475,6 +511,19 @@ namespace Dsh.Msys2Installer
                 Console.Error.WriteLine("error: " + error.Message);
                 return 1;
             }
+        }
+
+        private static int Usage(int exitCode)
+        {
+            Console.WriteLine("usage: msys2-installer-cli.exe --list");
+            Console.WriteLine("       msys2-installer-cli.exe --install [--shell-cmd <path>] [--flavour <key>]...");
+            Console.WriteLine();
+            Console.WriteLine("  --list      print the five flavours and their preset ids");
+            Console.WriteLine("  --install   write the presets (default: every flavour)");
+            Console.WriteLine();
+            Console.WriteLine("The GUI equivalent is msys2-installer.exe; it is a winexe and");
+            Console.WriteLine("therefore cannot report an exit code or capture stdout.");
+            return exitCode;
         }
     }
 }

@@ -113,6 +113,7 @@ jobs:
         run: |
           $expected = @(
             'build\msys2-installer.exe',
+            'build\msys2-installer-cli.exe',
             'build\msys2-tests.exe',
             'build\Msys2ShellShim.cs'
           )
@@ -248,8 +249,14 @@ jobs:
           Write-Host "coverage written to coverage.xml"
 
       - name: Verify the headless CLI
+        # Uses msys2-installer-cli.exe, not msys2-installer.exe. The GUI binary
+        # is /target:winexe (PE subsystem 2): it has no console, and the caller
+        # cannot observe its exit code at all. That is why this check used to
+        # fail with "--list exited " and a blank number — $LASTEXITCODE was
+        # empty, and `$null -ne 0` is true. The CLI is a console-subsystem
+        # binary, so both stdout and the exit code behave normally.
         run: |
-          $listing = & .\build\msys2-installer.exe --list
+          $listing = & .\build\msys2-installer-cli.exe --list
           if ($LASTEXITCODE -ne 0) { Write-Error "--list exited $LASTEXITCODE"; exit 1 }
           $listing | Write-Host
           foreach ($flavour in 'mingw64','mingw32','ucrt64','clang64','clangarm64') {
@@ -264,7 +271,7 @@ jobs:
         # Run against the REAL default DSH_HOME here, because this is the
         # configuration a user actually gets on a released build.
         run: |
-          & .\build\msys2-installer.exe --install
+          & .\build\msys2-installer-cli.exe --install
           if ($LASTEXITCODE -ne 0) { Write-Error "--install exited $LASTEXITCODE"; exit 1 }
 
           $presets = Join-Path $env:USERPROFILE '.dsh\.agent-presets'
@@ -355,6 +362,7 @@ jobs:
             coverage.xml
             test-output.txt
             build/msys2-installer.exe
+            build/msys2-installer-cli.exe
             build/msys2-tests.exe
             build/msys2-tests.pdb
             build/Msys2ShellShim.cs

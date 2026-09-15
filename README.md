@@ -20,13 +20,24 @@ Then tick the flavours you want and press Install. The GUI finds
 it cannot, Browse… opens a file dialog and the selected path is validated
 immediately, with the reason shown when it is wrong.
 
-Headless, for scripting:
+Headless, for scripting — use the **CLI**, not the GUI binary:
 
 ```
-build\msys2-installer.exe --list
-build\msys2-installer.exe --install
-build\msys2-installer.exe --install --shell-cmd C:\msys64\msys2_shell.cmd --flavour mingw64
+build\msys2-installer-cli.exe --list
+build\msys2-installer-cli.exe --install
+build\msys2-installer-cli.exe --install --shell-cmd C:\msys64\msys2_shell.cmd --flavour mingw64
 ```
+
+`msys2-installer-cli.exe` is a separate, **console**-subsystem build of the same
+logic. `msys2-installer.exe` is a WinForms GUI (`/target:winexe`, PE subsystem
+2), and such a process cannot serve as a CLI: it has no console, its stdout is
+not captured, and — the part that bites — **the caller cannot read its exit
+code**. In PowerShell a winexe leaves `$LASTEXITCODE` empty, and
+`$LASTEXITCODE -ne 0` then evaluates as `$null -ne 0`, which is *true*: a
+successful run looks like a failure. That is exactly how CI's `--list` check
+used to fail, with the message `--list exited ` and no number.
+
+Both binaries share every line of installer logic; only the entry point differs.
 
 ## Finding MSYS2
 
@@ -175,7 +186,7 @@ report can be attributed correctly.
 | `src/PresetWriter.cs` | composition/metadata/README generation; install and uninstall |
 | `src/ShimBuilder.cs` | locating `csc.exe` and compiling the shim |
 | `src/Msys2ShellShim.cs` | the shim itself |
-| `src/InstallerForm.cs` | the WinForms GUI and the headless CLI |
+| `src/InstallerForm.cs` | the WinForms GUI (`Program`) and the headless CLI (`ProgramCli`) |
 | `tests/` | the C# test suite |
 | `.env.example` | template for the git-ignored per-machine MSYS2 configuration |
 

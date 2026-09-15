@@ -138,6 +138,7 @@ jobs:
         run: |
           $expected = @(
             'build\msys2-installer.exe',
+            'build\msys2-installer-cli.exe',
             'build\msys2-tests.exe',
             'build\Msys2ShellShim.cs'
           )
@@ -328,8 +329,16 @@ jobs:
         # The README documents this surface, and a WinForms build can compile
         # yet still fail before Main's argument parsing. --list is side-effect
         # free (--install is not: it writes presets).
+        #
+        # This checks msys2-installer-cli.exe, NOT msys2-installer.exe. The
+        # latter is /target:winexe (PE subsystem 2); such a process has no
+        # console and its exit code CANNOT be observed by the caller, which is
+        # precisely how this step used to fail: $LASTEXITCODE came back empty,
+        # `$LASTEXITCODE -ne 0` evaluated as `$null -ne 0` — true — and the step
+        # died with "--list exited " and no number. The CLI is a console
+        # subsystem binary, so stdout and the exit code both work normally.
         run: |
-          $listing = & .\build\msys2-installer.exe --list
+          $listing = & .\build\msys2-installer-cli.exe --list
           if ($LASTEXITCODE -ne 0) { Write-Error "--list exited $LASTEXITCODE"; exit 1 }
           $listing | Write-Host
           foreach ($flavour in 'mingw64','mingw32','ucrt64','clang64','clangarm64') {
@@ -344,7 +353,7 @@ jobs:
         env:
           DSH_HOME: ${{ github.workspace }}\.ci-dsh-home
         run: |
-          & .\build\msys2-installer.exe --install
+          & .\build\msys2-installer-cli.exe --install
           if ($LASTEXITCODE -ne 0) { Write-Error "--install exited $LASTEXITCODE"; exit 1 }
 
           $presets = Join-Path $env:DSH_HOME '.agent-presets'
@@ -394,6 +403,7 @@ jobs:
             coverage.xml
             test-output.txt
             build/msys2-installer.exe
+            build/msys2-installer-cli.exe
             build/msys2-tests.exe
             build/msys2-tests.pdb
             build/Msys2ShellShim.cs
