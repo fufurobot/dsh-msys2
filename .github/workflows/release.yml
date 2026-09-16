@@ -248,6 +248,54 @@ jobs:
           }
           Write-Host "coverage written to coverage.xml"
 
+      - name: Install the DSH harness
+        # As in ci.yml, and MORE so here: until now this workflow validated its
+        # presets against a js-yaml it installed by hand into
+        # %USERPROFILE%\.dsh\profiles\node_modules, and never installed the
+        # harness at all. A release gate that never installs DSH cannot support
+        # the claim that the presets work in DSH.
+        #
+        # A release is the one place where the harness's own version matters, so
+        # it is printed here and recorded in the run summary rather than assumed.
+        #
+        # `npx @deepseek-ai/dsh --version` is side-effect free, unlike `dsh web`.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npx --yes @deepseek-ai/dsh@latest --version
+          if ($LASTEXITCODE -ne 0) { Write-Error "dsh --version exited $LASTEXITCODE"; exit 1 }
+
+      - name: Verify the DSH install and smoke-test its CLI
+        # Fatal here, not merely reported: a release whose presets were never
+        # accepted by a real harness is exactly the unverified claim this
+        # workflow exists to refuse.
+        run: |
+          $profiles = Join-Path $env:USERPROFILE '.dsh\profiles'
+          $yaml = Join-Path $profiles 'node_modules\js-yaml'
+          $dsh = Join-Path $profiles 'node_modules\@deepseek-ai\dsh'
+
+          foreach ($p in @($yaml, $dsh)) {
+            if (-not (Test-Path $p)) { Write-Error "the DSH install did not produce $p"; exit 1 }
+          }
+
+          $dshPkg = Get-Content (Join-Path $dsh 'package.json') -Raw | ConvertFrom-Json
+          $yamlPkg = Get-Content (Join-Path $yaml 'package.json') -Raw | ConvertFrom-Json
+          Write-Host "dsh:     $($dshPkg.version)"
+          Write-Host "js-yaml: $($yamlPkg.version)  (a real dependency of dsh)"
+
+          # Record the harness version in the release summary: a preset that
+          # validated on one harness release and not another is a fact a reader
+          # of this run needs.
+          "dsh=$($dshPkg.version)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          $help = npx --yes @deepseek-ai/dsh@latest --help 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { Write-Error "dsh --help exited $LASTEXITCODE"; exit 1 }
+          if ($help -notmatch 'web') {
+            Write-Error "the dsh CLI does not document a 'web' command; the README's quick start would be wrong"
+            exit 1
+          }
+          Write-Host "ok   the released DSH installs and its CLI documents 'web'"
+        id: dsh_smoke
+
       - name: Verify the headless CLI
         # Uses msys2-installer-cli.exe, not msys2-installer.exe. The GUI binary
         # is /target:winexe (PE subsystem 2): it has no console, and the caller
@@ -259,12 +307,36 @@ jobs:
           $listing = & .\build\msys2-installer-cli.exe --list
           if ($LASTEXITCODE -ne 0) { Write-Error "--list exited $LASTEXITCODE"; exit 1 }
           $listing | Write-Host
-          foreach ($flavour in 'mingw64','mingw32','ucrt64','clang64','clangarm64') {
-            if ($listing -notmatch [regex]::Escape($flavour)) {
-              Write-Error "flavour '$flavour' is missing from --list"
-              exit 1
-            }
+
+          # See ci.yml for the full explanation. In short: `$listing -notmatch
+          # <re>` is a FILTER on a collection, not a boolean test. It returns the
+          # elements that did not match, so a flavour that IS present still
+          # produced a non-empty array, which `if` reads as $true. Exact-key
+          # comparison below cannot misfire that way.
+          $keys = @{}
+          foreach ($line in $listing) {
+            $cols = $line -split "`t"
+            if ($cols.Count -ge 1 -and $cols[0]) { $keys[$cols[0]] = $line }
           }
+
+          $expected = 'mingw64','mingw32','ucrt64','clang64','clangarm64'
+          $missing = @($expected | Where-Object { -not $keys.ContainsKey($_) })
+          $extra   = @($keys.Keys | Where-Object { $expected -notcontains $_ })
+
+          if ($missing.Count -gt 0) {
+            Write-Error "flavours missing from --list: $($missing -join ', ')"
+            exit 1
+          }
+          if ($extra.Count -gt 0) {
+            Write-Error "unexpected flavours in --list: $($extra -join ', ')"
+            exit 1
+          }
+          if ($keys.Count -ne 5) {
+            Write-Error "--list printed $($keys.Count) flavours, expected 5"
+            exit 1
+          }
+
+          $expected | ForEach-Object { Write-Host "ok   $_" }
           Write-Host "all five flavours are listed"
 
       - name: End-to-end install and preset validation
@@ -295,15 +367,16 @@ jobs:
           }
           Write-Host "installed and compiled the shim for all 5 flavours"
 
-          $yamlDir = Join-Path $env:USERPROFILE '.dsh\profiles'
-          if (-not (Test-Path (Join-Path $yamlDir 'node_modules\js-yaml'))) {
-            New-Item -ItemType Directory -Force -Path $yamlDir | Out-Null
-            Push-Location $yamlDir
-            try {
-              npm install --no-save --no-package-lock --silent js-yaml@4
-              if ($LASTEXITCODE -ne 0) { Write-Error "npm install js-yaml failed"; exit 1 }
-            } finally { Pop-Location }
+          # The YAML library now comes from the real DSH install above, instead
+          # of being hand-installed into the directory the script happens to
+          # read. Asserted here so a missing harness fails loudly.
+          $yaml = Join-Path $env:USERPROFILE '.dsh\profiles\node_modules\js-yaml'
+          if (-not (Test-Path $yaml)) {
+            Write-Error "js-yaml is missing at $yaml; the DSH install step did not provide it"
+            exit 1
           }
+          Write-Host "validating with the harness's own YAML library: $yaml"
+
           node tests/validate-preset.cjs $presets
           if ($LASTEXITCODE -ne 0) {
             Write-Error "preset validation failed with exit code $LASTEXITCODE"
@@ -320,6 +393,10 @@ jobs:
           $summary += ""
           $summary += "**Policy: every test must run.** A skip fails this workflow."
           $summary += ""
+          if ('${{ steps.dsh_smoke.outputs.dsh }}') {
+            $summary += "Presets were validated against **@deepseek-ai/dsh ${{ steps.dsh_smoke.outputs.dsh }}**."
+            $summary += ""
+          }
 
           $counts = Select-String -Path test-output.txt -Pattern '^(passed|failed|skipped|total):\s+(\d+)' -ErrorAction SilentlyContinue
           if ($counts) {

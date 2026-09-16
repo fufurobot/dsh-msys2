@@ -212,7 +212,43 @@ with that reason rather than passing silently.
 
 `tests/validate-preset.cjs` additionally parses every installed preset with the
 same YAML library DSH uses, checking the composition shape that
-`dsh-agent-presets` requires.
+`dsh-agent-presets` requires. It loads that library from the installed harness
+at `%USERPROFILE%\.dsh\profiles\node_modules\js-yaml`, and exits 2 rather than
+skipping when it is absent — so a validation result always names the library
+version it was produced with.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` builds, runs the suite under OpenCover and reports
+coverage. `.github/workflows/release.yml` runs the same suite and additionally
+**fails on any skipped test**: a release that shipped on unrun checks would be
+shipping the claims above with none of their evidence.
+
+Both workflows install the DSH harness itself:
+
+```
+npx --yes @deepseek-ai/dsh@latest --version
+```
+
+This is what supplies `js-yaml` — a direct dependency of the published package —
+to `validate-preset.cjs`, instead of hand-installing a stand-in into the
+directory the script happens to read. It also makes a real smoke test possible:
+`dsh --help` must exit 0 and document the `web` command the quick start tells
+users to run. Nothing else in CI would notice if that command were renamed.
+
+Two PowerShell traps are worth naming here, because both have already broken
+this pipeline once:
+
+- **A `winexe` cannot be used as a CLI.** `msys2-installer.exe` has no console
+  and its exit code cannot be observed by the caller, so CI checks
+  `msys2-installer-cli.exe` (console subsystem) instead. See
+  [Finding MSYS2](#finding-msys2) for the failure this caused.
+- **`-notmatch` on a collection is a filter, not a boolean.** `$listing -notmatch 'mingw64'`
+  does not answer "is mingw64 absent?" — it returns the elements that did *not*
+  match. Since one line did match, it returned the other four, a non-empty array
+  that `if` reads as `$true`, and the check failed while printing the flavour it
+  claimed was missing. CI now compares exact keys parsed from the tab-separated
+  listing, which also catches an extra or renamed flavour.
 
 ## Requirements
 

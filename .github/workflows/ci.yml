@@ -325,6 +325,97 @@ jobs:
           $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           $summary | ForEach-Object { Write-Host $_ }
 
+      - name: Install the DSH harness
+        # Nothing in this workflow previously installed DSH, so there was no
+        # harness to smoke-test and tests/validate-preset.cjs had to fake its
+        # dependency: it loads js-yaml from
+        # %USERPROFILE%\.dsh\profiles\node_modules\js-yaml — a path only a real
+        # DSH install creates — and a later step used to `npm install js-yaml`
+        # into that directory by hand to satisfy it.
+        #
+        # That hand-rolled install was the wrong shape in two ways. It validated
+        # presets against a library version DSH might not use, and it proved
+        # nothing about the harness actually being installable and bootable,
+        # which is the claim this project rests on: the presets are only
+        # meaningful if DSH can load them.
+        #
+        # `npx @deepseek-ai/dsh` is the documented entry point (README: "after
+        # installing you just run npx @deepseek-ai/dsh web"). Its --version and
+        # --help are side-effect free; a bare `dsh web` would bind a port and
+        # block, which is why the smoke check below does not do that.
+        #
+        # js-yaml is a DIRECT dependency of the published package (^4.2.0), so
+        # installing DSH puts the real library exactly where validate-preset.cjs
+        # looks, with no separate install step and no version guessing.
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Pin nothing: "latest" is the point, because the presets must load on
+          # whatever a user gets from `npx` today. --version prints the resolved
+          # version, so the log records which harness release this run was
+          # validated against and a future failure can be attributed to it.
+          npx --yes @deepseek-ai/dsh@latest --version
+          if ($LASTEXITCODE -ne 0) { Write-Error "dsh --version exited $LASTEXITCODE"; exit 1 }
+
+      - name: Verify the DSH install landed where the preset tooling looks
+        # The install is only useful if it produces the exact layout
+        # validate-preset.cjs and DSH's own preset discovery read. Assert that
+        # layout here, so a change in the harness's install shape fails with a
+        # precise message instead of surfacing later as a confusing js-yaml
+        # "module not found" or, worse, as a silently unvalidated preset.
+        run: |
+          $profiles = Join-Path $env:USERPROFILE '.dsh\profiles'
+          $yaml = Join-Path $profiles 'node_modules\js-yaml'
+          $dsh = Join-Path $profiles 'node_modules\@deepseek-ai\dsh'
+
+          foreach ($p in @($yaml, $dsh)) {
+            if (-not (Test-Path $p)) {
+              Write-Host "expected the DSH install to provide:"
+              Write-Host "  $yaml"
+              Write-Host "  $dsh"
+              Write-Host "found under ${profiles}:"
+              if (Test-Path $profiles) {
+                Get-ChildItem $profiles -Force | ForEach-Object { Write-Host "  $($_.Name)" }
+              } else {
+                Write-Host "  (the directory does not exist at all)"
+              }
+              Write-Error "the DSH install did not produce $p"
+              exit 1
+            }
+          }
+
+          # Report the versions actually in play. These two numbers are the
+          # provenance of every preset validation result in this run.
+          $dshPkg = Get-Content (Join-Path $dsh 'package.json') -Raw | ConvertFrom-Json
+          $yamlPkg = Get-Content (Join-Path $yaml 'package.json') -Raw | ConvertFrom-Json
+          Write-Host "dsh:     $($dshPkg.version)"
+          Write-Host "js-yaml: $($yamlPkg.version)  (a real dependency of dsh, not a stand-in)"
+
+      - name: Smoke-test the DSH CLI against the installed presets
+        # The point of this step is the claim nothing else in this workflow
+        # tests: that the harness is present, runnable, and aware of the preset
+        # surface this installer writes into. `dsh --help` exercises the real
+        # argument parser and plugin boot, which a preset validation alone does
+        # not.
+        #
+        # Deliberately NOT `dsh web`: that starts a server and blocks, so it
+        # would need a port, a readiness probe and a teardown to prove only
+        # slightly more than --help already does here.
+        run: |
+          $help = npx --yes @deepseek-ai/dsh@latest --help 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { Write-Error "dsh --help exited $LASTEXITCODE"; exit 1 }
+
+          Write-Host $help
+
+          # `web` is the documented command in the README's quick start, so it
+          # must be a recognised verb. If the harness ever renames it, the
+          # README's instructions break and this catches that.
+          if ($help -notmatch 'web') {
+            Write-Error "the dsh CLI does not document a 'web' command; the README's quick start would be wrong"
+            exit 1
+          }
+          Write-Host "ok   dsh CLI is installed and documents the 'web' command"
+
       - name: Verify headless CLI
         # The README documents this surface, and a WinForms build can compile
         # yet still fail before Main's argument parsing. --list is side-effect
@@ -341,12 +432,42 @@ jobs:
           $listing = & .\build\msys2-installer-cli.exe --list
           if ($LASTEXITCODE -ne 0) { Write-Error "--list exited $LASTEXITCODE"; exit 1 }
           $listing | Write-Host
-          foreach ($flavour in 'mingw64','mingw32','ucrt64','clang64','clangarm64') {
-            if ($listing -notmatch [regex]::Escape($flavour)) {
-              Write-Error "flavour '$flavour' is missing from --list"
-              exit 1
-            }
+
+          # Parse the listing into (key -> line) instead of pattern-matching the
+          # whole array. `$listing -notmatch <re>` is NOT a boolean test: on a
+          # collection, -notmatch FILTERS, returning the elements that did not
+          # match. 'mingw64' matches only line 1, so the expression returned the
+          # other 4 lines — a non-empty array, which `if` coerces to $true — and
+          # the step failed with "flavour 'mingw64' is missing from --list" while
+          # printing mingw64 on the line directly above. An empty array is the
+          # only falsy collection, so a missing flavour and a present one were
+          # indistinguishable. Compare exact keys, which cannot drift.
+          $keys = @{}
+          foreach ($line in $listing) {
+            $cols = $line -split "`t"
+            if ($cols.Count -ge 1 -and $cols[0]) { $keys[$cols[0]] = $line }
           }
+
+          # Assert the exact key set, so a sixth flavour or a dropped one fails
+          # here rather than passing on a substring hit.
+          $expected = 'mingw64','mingw32','ucrt64','clang64','clangarm64'
+          $missing = @($expected | Where-Object { -not $keys.ContainsKey($_) })
+          $extra   = @($keys.Keys | Where-Object { $expected -notcontains $_ })
+
+          if ($missing.Count -gt 0) {
+            Write-Error "flavours missing from --list: $($missing -join ', ')"
+            exit 1
+          }
+          if ($extra.Count -gt 0) {
+            Write-Error "unexpected flavours in --list: $($extra -join ', ')"
+            exit 1
+          }
+          if ($keys.Count -ne 5) {
+            Write-Error "--list printed $($keys.Count) flavours, expected 5"
+            exit 1
+          }
+
+          $expected | ForEach-Object { Write-Host "ok   $_" }
           Write-Host "all five flavours are listed"
 
       - name: End-to-end install and preset validation
@@ -373,21 +494,19 @@ jobs:
           }
 
           # validate-preset.cjs deliberately validates with the same YAML
-          # library DSH uses, which it loads from the installed harness at
-          # $USERPROFILE\.dsh\profiles\node_modules\js-yaml. That path does not
-          # exist on a clean runner, and overriding USERPROFILE to fake it
-          # would break the lookup it is meant to satisfy. Install js-yaml into
-          # the exact directory the script reads instead. (It exits 2 rather
-          # than skipping when the library is absent, so this must be real.)
-          $yamlDir = Join-Path $env:USERPROFILE '.dsh\profiles'
-          if (-not (Test-Path (Join-Path $yamlDir 'node_modules\js-yaml'))) {
-            New-Item -ItemType Directory -Force -Path $yamlDir | Out-Null
-            Push-Location $yamlDir
-            try {
-              npm install --no-save --no-package-lock --silent js-yaml@4
-              if ($LASTEXITCODE -ne 0) { Write-Error "npm install js-yaml failed"; exit 1 }
-            } finally { Pop-Location }
+          # library DSH uses, loaded from the installed harness at
+          # $USERPROFILE\.dsh\profiles\node_modules\js-yaml. That library is now
+          # supplied by the "Install the DSH harness" step above, as a real
+          # dependency of the real package rather than a hand-installed stand-in.
+          # Assert it is present here so this step fails with a clear message
+          # rather than the script's generic "could not load js-yaml" (exit 2).
+          $yaml = Join-Path $env:USERPROFILE '.dsh\profiles\node_modules\js-yaml'
+          if (-not (Test-Path $yaml)) {
+            Write-Error "js-yaml is missing at $yaml; the DSH install step did not provide it"
+            exit 1
           }
+          Write-Host "validating with the harness's own YAML library: $yaml"
+
           node tests/validate-preset.cjs $presets
           if ($LASTEXITCODE -ne 0) {
             Write-Error "preset validation failed with exit code $LASTEXITCODE"
